@@ -2,9 +2,10 @@
 
 结构:
 
-- submit 在调用方线程通过校验后，任务进入有界的入站队列（先到先服务）。
+- submit / submit_nowait 在调用方线程通过校验后，任务进入有界的入站队列
+  （先到先服务）；submit 阻塞等待结果，submit_nowait 立即返回 TaskHandle。
 - 一个事件循环线程按入队顺序取出任务，在有空闲工作线程时派发到就绪队列。
-- 工作线程执行无参数 callable，记录排队/总延迟，唤醒 submit 的等待方。
+- 工作线程执行无参数 callable，记录排队/总延迟，唤醒等待方。
 - 未完成（已接受但未结束）任务数达到 ``max_pending`` 时触发背压拒绝。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
   已完成任务的结果在关闭后仍可读取。
@@ -56,6 +57,45 @@ class _TaskEntry:
         self.success = False
         self.value: Any = None
         self.exception: Optional[BaseException] = None
+
+
+class TaskHandle:
+    """非阻塞提交（:meth:`Scheduler.submit_nowait`）返回的任务句柄。
+
+    句柄绑定到提交时创建的任务条目：即使 task_id 之后被复用，
+    通过该句柄读到的仍是本次提交的结果。
+    """
+
+    __slots__ = ("_entry",)
+
+    def __init__(self, entry: "_TaskEntry") -> None:
+        self._entry = entry
+
+    def done(self) -> bool:
+        """任务已结束（无论成功或失败）返回 True，否则 False。"""
+        return self._entry.done.is_set()
+
+    def result(self, timeout: Optional[float] = None) -> Any:
+        """等待并读取任务结果。
+
+        - 成功：返回 callable 的返回值；失败：抛出 callable 抛出的原始异常。
+        - ``timeout`` 为 None 时一直等待；有限超时内未结束则抛
+          :class:`TimeoutError`，任务本身继续执行，之后仍可再次读取结果。
+        """
+        if timeout is not None and timeout < 0:
+            raise InputValidationError(
+                "timeout must be >= 0 or None, got %r" % (timeout,)
+            )
+        entry = self._entry
+        if not entry.done.wait(timeout):
+            raise TimeoutError(
+                "task %r did not finish within %s seconds"
+                % (entry.task_id, timeout)
+            )
+        if entry.success:
+            return entry.value
+        assert entry.exception is not None
+        raise entry.exception
 
 
 class Scheduler:
@@ -134,38 +174,11 @@ class Scheduler:
         :param fn: 无参数 callable。
         :param timeout: 可选等待超时（秒），None 表示一直等待。
         """
-        if not isinstance(task_id, str) or task_id == "":
-            raise InputValidationError(
-                "task_id must be a non-empty str, got %r" % (task_id,)
-            )
-        if not callable(fn):
-            raise InputValidationError("fn must be callable, got %r" % (fn,))
         if timeout is not None and timeout < 0:
             raise InputValidationError(
                 "timeout must be >= 0 or None, got %r" % (timeout,)
             )
-
-        with self._cond:
-            if self._closing:
-                raise SchedulerClosedError("scheduler is closed")
-            if task_id in self._unfinished:
-                raise DuplicateTaskError(
-                    "task_id %r is already pending" % (task_id,)
-                )
-            if self._pending >= self._max_pending:
-                self._stats.record_rejected()
-                raise BackpressureError(
-                    "pending task limit %d reached" % self._max_pending
-                )
-
-            entry = _TaskEntry(task_id, fn, time.monotonic())
-            self._tasks[task_id] = entry
-            self._unfinished.add(task_id)
-            self._pending += 1
-            self._stats.record_accepted()
-
-        # 入队在锁外：Queue 本身线程安全，入队顺序即接受顺序（FCFS）。
-        self._inbound.put(task_id)
+        entry = self._admit(task_id, fn)
 
         if not entry.done.wait(timeout):
             raise TimeoutError(
@@ -175,6 +188,20 @@ class Scheduler:
             return entry.value  # type: ignore[no-any-return]
         assert entry.exception is not None
         raise entry.exception
+
+    def submit_nowait(self, task_id: str, fn: Callable[[], T]) -> TaskHandle:
+        """提交任务并立即返回句柄，不等待 callable 执行结束。
+
+        准入校验与 :meth:`submit` 完全一致（参数校验、关闭、重复 task_id、
+        背压），通过后任务进入同一事件循环由工作线程按顺序派发；
+        返回前 accepted 计数已更新。任务进度与结果通过返回的
+        :class:`TaskHandle` 查询。
+
+        :param task_id: 非空字符串，任务唯一标识。
+        :param fn: 无参数 callable。
+        """
+        entry = self._admit(task_id, fn)
+        return TaskHandle(entry)
 
     def result(self, task_id: str) -> Any:
         """读取一个已结束任务的结果（非阻塞）。
@@ -241,6 +268,42 @@ class Scheduler:
             self._cond.notify_all()
 
     # ------------------------------------------------------------- internals
+
+    def _admit(self, task_id: str, fn: Callable[[], Any]) -> "_TaskEntry":
+        """校验参数并完成准入：登记任务、更新计数、放入入站队列。
+
+        submit 与 submit_nowait 共用；任何失败路径都不产生任务条目，
+        除背压拒绝计入 rejected 外不改变统计。
+        """
+        if not isinstance(task_id, str) or task_id == "":
+            raise InputValidationError(
+                "task_id must be a non-empty str, got %r" % (task_id,)
+            )
+        if not callable(fn):
+            raise InputValidationError("fn must be callable, got %r" % (fn,))
+
+        with self._cond:
+            if self._closing:
+                raise SchedulerClosedError("scheduler is closed")
+            if task_id in self._unfinished:
+                raise DuplicateTaskError(
+                    "task_id %r is already pending" % (task_id,)
+                )
+            if self._pending >= self._max_pending:
+                self._stats.record_rejected()
+                raise BackpressureError(
+                    "pending task limit %d reached" % self._max_pending
+                )
+
+            entry = _TaskEntry(task_id, fn, time.monotonic())
+            self._tasks[task_id] = entry
+            self._unfinished.add(task_id)
+            self._pending += 1
+            self._stats.record_accepted()
+
+        # 入队在锁外：Queue 本身线程安全，入队顺序即接受顺序（FCFS）。
+        self._inbound.put(task_id)
+        return entry
 
     def _run_dispatcher(self) -> None:
         """事件循环：按 FCFS 顺序把任务派发给空闲工作线程。"""

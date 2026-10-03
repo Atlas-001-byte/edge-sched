@@ -10,6 +10,7 @@ from edge_sched import (
     InputValidationError,
     Scheduler,
     SchedulerClosedError,
+    TaskHandle,
 )
 
 
@@ -332,6 +333,163 @@ class SnapshotLatencyTest(unittest.TestCase):
         self.assertGreaterEqual(
             snap.total_latency_ms["max"], snap.queue_wait_ms["max"]
         )
+
+
+class SubmitNowaitTest(unittest.TestCase):
+    def test_returns_handle_immediately(self) -> None:
+        release = threading.Event()
+
+        def slow() -> str:
+            release.wait(2.0)
+            return "v"
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("h", slow)
+            self.assertIsInstance(handle, TaskHandle)
+            # 任务被阻塞在执行中，句柄此刻未结束。
+            self.assertFalse(handle.done())
+            release.set()
+            self.assertEqual(handle.result(), "v")
+            self.assertTrue(handle.done())
+
+    def test_handle_result_success_and_failure(self) -> None:
+        def boom() -> None:
+            raise ValueError("bad")
+
+        with Scheduler(workers=2, max_pending=4) as s:
+            ok = s.submit_nowait("ok", lambda: 42)
+            bad = s.submit_nowait("bad", boom)
+            self.assertEqual(ok.result(), 42)
+            with self.assertRaises(ValueError) as cm:
+                bad.result()
+            self.assertEqual(str(cm.exception), "bad")
+            # 结果唯一且可重复读取。
+            self.assertEqual(ok.result(), 42)
+
+    def test_handle_result_timeout_task_continues(self) -> None:
+        release = threading.Event()
+
+        def slow() -> int:
+            release.wait(2.0)
+            return 7
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("slow", slow)
+            with self.assertRaises(TimeoutError):
+                handle.result(timeout=0.05)
+            self.assertFalse(handle.done())
+            # 超时后任务继续，句柄之后仍能取得唯一结果。
+            release.set()
+            self.assertEqual(handle.result(timeout=2.0), 7)
+            self.assertTrue(handle.done())
+
+    def test_handle_result_bad_timeout(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("t", lambda: 1)
+            with self.assertRaises(InputValidationError):
+                handle.result(timeout=-1)
+            self.assertEqual(handle.result(), 1)
+
+    def test_validation_errors(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            for bad_id in ("", 1, None, b"x"):
+                with self.subTest(bad_id=bad_id):
+                    with self.assertRaises(InputValidationError):
+                        s.submit_nowait(bad_id, lambda: None)  # type: ignore[arg-type]
+            with self.assertRaises(InputValidationError):
+                s.submit_nowait("t", "not-callable")  # type: ignore[arg-type]
+        # 校验失败不改变统计。
+        snap = s.snapshot()
+        self.assertEqual(
+            (snap.accepted, snap.completed, snap.failed, snap.rejected),
+            (0, 0, 0, 0),
+        )
+
+    def test_submit_nowait_after_close(self) -> None:
+        s = Scheduler(workers=1, max_pending=2)
+        s.close()
+        with self.assertRaises(SchedulerClosedError):
+            s.submit_nowait("late", lambda: None)
+        self.assertEqual(s.snapshot().accepted, 0)
+        self.assertEqual(s.snapshot().rejected, 0)
+
+    def test_duplicate_while_unfinished(self) -> None:
+        release = threading.Event()
+
+        def slow() -> None:
+            release.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=4) as s:
+            handle = s.submit_nowait("d", slow)
+            with self.assertRaises(DuplicateTaskError):
+                s.submit_nowait("d", lambda: None)
+            release.set()
+            self.assertIsNone(handle.result())
+
+    def test_backpressure_rejects_without_side_effects(self) -> None:
+        release = threading.Event()
+
+        def slow() -> str:
+            release.wait(2.0)
+            return "x"
+
+        with Scheduler(workers=1, max_pending=1) as s:
+            handle = s.submit_nowait("only", slow)
+            self.assertTrue(_wait_accepted(s, 1))
+            with self.assertRaises(BackpressureError):
+                s.submit_nowait("extra", lambda: None)
+            # 计入 rejected 而不计 accepted，且不留任务痕迹。
+            self.assertEqual(s.snapshot().accepted, 1)
+            self.assertEqual(s.snapshot().rejected, 1)
+            with self.assertRaises(KeyError):
+                s.result("extra")
+            release.set()
+            # 已有任务不受影响。
+            self.assertEqual(handle.result(), "x")
+            # 被拒的 task_id 之后仍可正常使用。
+            self.assertEqual(s.submit_nowait("extra", lambda: 3).result(), 3)
+
+    def test_accepted_counted_before_return(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("a", lambda: release.wait(2.0))
+            # submit_nowait 返回时 accepted 已更新（任务可能尚未执行）。
+            self.assertEqual(s.snapshot().accepted, 1)
+            release.set()
+            handle.result()
+
+    def test_stats_visible_when_result_returns(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("s", lambda: "v")
+            self.assertEqual(handle.result(), "v")
+            # result 返回时完成计数与延迟样本已入快照。
+            snap = s.snapshot()
+            self.assertEqual(snap.completed, 1)
+            self.assertEqual(len(_samples(snap, "total")), 1)
+            self.assertEqual(len(_samples(snap, "wait")), 1)
+
+    def test_handle_and_result_by_task_id_coexist(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("mix", lambda: 5)
+            self.assertEqual(handle.result(), 5)
+            self.assertEqual(s.result("mix"), 5)
+
+    def test_handle_survives_task_id_reuse(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            first = s.submit_nowait("r", lambda: "old")
+            self.assertEqual(first.result(), "old")
+            second = s.submit_nowait("r", lambda: "new")
+            self.assertEqual(second.result(), "new")
+            # task_id 复用后，先前句柄仍读取其对应的结果。
+            self.assertEqual(first.result(), "old")
+            self.assertEqual(s.result("r"), "new")
+
+    def test_handle_result_after_close(self) -> None:
+        s = Scheduler(workers=1, max_pending=2)
+        handle = s.submit_nowait("c", lambda: "done")
+        s.close()
+        self.assertTrue(handle.done())
+        self.assertEqual(handle.result(), "done")
 
 
 def _wait_accepted(s: Scheduler, n: int) -> bool:
