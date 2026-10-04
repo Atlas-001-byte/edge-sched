@@ -7,9 +7,11 @@ import unittest
 from edge_sched import (
     BackpressureError,
     DuplicateTaskError,
+    EdgeSchedError,
     InputValidationError,
     Scheduler,
     SchedulerClosedError,
+    TaskCancelledError,
     TaskHandle,
 )
 
@@ -490,6 +492,264 @@ class SubmitNowaitTest(unittest.TestCase):
         s.close()
         self.assertTrue(handle.done())
         self.assertEqual(handle.result(), "done")
+
+
+class CancelTest(unittest.TestCase):
+    def test_cancel_queued_task_never_runs(self) -> None:
+        release = threading.Event()
+        ran: list[str] = []
+        lock = threading.Lock()
+
+        def record(tid: str) -> "any":
+            def fn() -> str:
+                with lock:
+                    ran.append(tid)
+                return tid
+            return fn
+
+        # 单工作线程：a 占住线程，b 只能在入站队列中等待，此时取消必然先于执行。
+        with Scheduler(workers=1, max_pending=4) as s:
+            ha = s.submit_nowait("a", lambda: release.wait(2.0))
+            hb = s.submit_nowait("b", record("b"))
+            self.assertTrue(_wait_started(s, "a"))
+            self.assertTrue(hb.cancel())
+            self.assertTrue(hb.done())
+            # callable 完全不执行。
+            with self.assertRaises(TaskCancelledError):
+                hb.result()
+            # 重复取消返回 False，不改变终态，也不重复计数。
+            self.assertFalse(hb.cancel())
+            with self.assertRaises(TaskCancelledError):
+                hb.result()
+
+            release.set()
+            self.assertTrue(ha.result())
+
+        self.assertEqual(ran, [])
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 2)
+        self.assertEqual(snap.completed, 1)
+        self.assertEqual(snap.failed, 0)
+        self.assertEqual(snap.cancelled, 1)
+        # 取消任务不贡献延迟样本。
+        self.assertEqual(len(_samples(snap, "wait")), 1)
+        self.assertEqual(len(_samples(snap, "total")), 1)
+
+    def test_scheduler_result_raises_cancelled(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("c", lambda: "no")
+            self.assertTrue(handle.cancel())
+            with self.assertRaises(TaskCancelledError):
+                s.result("c")
+        # 关闭后历史取消结果仍可读取，且类型体系正确。
+        with self.assertRaises(TaskCancelledError) as cm:
+            s.result("c")
+        self.assertIsInstance(cm.exception, EdgeSchedError)
+
+    def test_cancel_after_start_returns_false(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow() -> str:
+            entered.set()
+            release.wait(2.0)
+            return "done"
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("a", slow)
+            self.assertTrue(entered.wait(2.0))
+            # 已开始执行：取消失败，任务运行到底，原终态保留。
+            self.assertFalse(handle.cancel())
+            self.assertFalse(handle.done())
+            release.set()
+            self.assertEqual(handle.result(), "done")
+            self.assertFalse(handle.cancel())
+        self.assertEqual(s.snapshot().cancelled, 0)
+        self.assertEqual(s.snapshot().completed, 1)
+
+    def test_cancel_after_finish_keeps_original_terminal_state(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            ok = s.submit_nowait("ok", lambda: 42)
+            self.assertEqual(ok.result(), 42)
+            self.assertFalse(ok.cancel())
+            self.assertEqual(ok.result(), 42)
+
+            def boom() -> None:
+                raise ValueError("x")
+
+            bad = s.submit_nowait("bad", boom)
+            with self.assertRaises(ValueError):
+                bad.result()
+            self.assertFalse(bad.cancel())
+            with self.assertRaises(ValueError):
+                bad.result()
+
+    def test_cancel_frees_pending_capacity(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2) as s:
+            s.submit_nowait("a", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "a"))
+            queued = s.submit_nowait("b", lambda: "b")
+            self.assertTrue(_wait_pending(s, 2))
+            # 上限已满，新提交被背压拒绝。
+            with self.assertRaises(BackpressureError):
+                s.submit_nowait("c", lambda: None)
+            # 取消排队中的 b：额度立即释放，c 得以接受。
+            self.assertTrue(queued.cancel())
+            hc = s.submit_nowait("c", lambda: "c")
+            release.set()
+            self.assertEqual(hc.result(), "c")
+        snap = s.snapshot()
+        self.assertEqual((snap.accepted, snap.cancelled, snap.completed),
+                         (3, 1, 2))
+
+    def test_task_id_reusable_immediately_after_cancel(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=4) as s:
+            s.submit_nowait("a", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "a"))
+            old = s.submit_nowait("r", lambda: "old")
+            self.assertTrue(old.cancel())
+
+            # 同名任务立即可以再提交，不报 DuplicateTaskError。
+            new = s.submit_nowait("r", lambda: "new")
+            release.set()
+            self.assertEqual(new.result(), "new")
+
+            # 旧句柄固定读取自己的取消结果；新句柄与 Scheduler.result
+            # 读取最新同名任务。
+            with self.assertRaises(TaskCancelledError):
+                old.result()
+            self.assertEqual(new.result(), "new")
+            self.assertEqual(s.result("r"), "new")
+
+    def test_cancel_does_not_block_close(self) -> None:
+        release = threading.Event()
+        s = Scheduler(workers=1, max_pending=4)
+        s.submit_nowait("a", lambda: release.wait(2.0))
+        self.assertTrue(_wait_started(s, "a"))
+        queued = s.submit_nowait("b", lambda: "b")
+
+        closed = threading.Event()
+
+        def do_close() -> None:
+            s.close()
+            closed.set()
+
+        t = threading.Thread(target=do_close)
+        t.start()
+        # a 仍在执行，close 在等待；取消排队中的 b 不造成异常。
+        self.assertTrue(queued.cancel())
+        self.assertFalse(closed.wait(0.2))
+        release.set()
+        self.assertTrue(closed.wait(2.0))
+        t.join()
+        # 关闭后取消结果仍可读取。
+        with self.assertRaises(TaskCancelledError):
+            queued.result()
+
+    def test_cancel_queued_behind_other_queued_task(self) -> None:
+        release = threading.Event()
+        ran: list[str] = []
+        lock = threading.Lock()
+
+        def rec(tid: str) -> "any":
+            def fn() -> None:
+                with lock:
+                    ran.append(tid)
+            return fn
+
+        with Scheduler(workers=1, max_pending=8) as s:
+            s.submit_nowait("a", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "a"))
+            hb = s.submit_nowait("b", rec("b"))
+            hc = s.submit_nowait("c", rec("c"))
+            # 取消排在 b 后面的 c：FCFS 不受影响，c 的 callable 不执行。
+            self.assertTrue(hc.cancel())
+            release.set()
+            self.assertEqual(hb.result(), None)
+            with self.assertRaises(TaskCancelledError):
+                hc.result()
+        self.assertEqual(ran, ["b"])
+
+    def test_cancel_vs_start_race_has_single_outcome(self) -> None:
+        # 大量任务在“即将开始”的窗口与 cancel 竞争：每个任务必须恰好
+        # 落入“执行完成”或“被取消”之一，不得部分执行后取消或重复计数。
+        n = 200
+        s = Scheduler(workers=4, max_pending=n + 1)
+        ran: set[str] = set()
+        ran_lock = threading.Lock()
+        handles: list[TaskHandle] = []
+
+        def make(tid: str) -> "any":
+            def fn() -> str:
+                # 极短等待，扩大 cancel 与认领交错的窗口。
+                time.sleep(0.001)
+                with ran_lock:
+                    ran.add(tid)
+                return tid
+            return fn
+
+        for i in range(n):
+            handles.append(s.submit_nowait("t%d" % i, make("t%d" % i)))
+
+        def race_cancel(h: TaskHandle) -> None:
+            h.cancel()
+
+        cancelers = [threading.Thread(target=race_cancel, args=(h,))
+                     for h in handles]
+        for t in cancelers:
+            t.start()
+        for t in cancelers:
+            t.join()
+        s.close()
+
+        outcomes: dict[str, str] = {}
+        for h in handles:
+            tid = h._entry.task_id  # type: ignore[attr-defined]
+            try:
+                h.result()
+                outcomes[tid] = "ran"
+            except TaskCancelledError:
+                outcomes[tid] = "cancelled"
+
+        # 每个任务唯一终态；ran 集合与终态完全一致（无“执行又取消”）。
+        self.assertEqual(len(outcomes), n)
+        for tid, outcome in outcomes.items():
+            if outcome == "ran":
+                self.assertIn(tid, ran)
+            else:
+                self.assertNotIn(tid, ran)
+        self.assertEqual(len(ran), sum(o == "ran" for o in outcomes.values()))
+
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, n)
+        self.assertEqual(
+            snap.completed + snap.failed + snap.cancelled, n
+        )
+        finished = snap.completed + snap.failed
+        self.assertEqual(len(_samples(snap, "wait")), finished)
+        self.assertEqual(len(_samples(snap, "total")), finished)
+
+
+def _wait_started(s: Scheduler, task_id: str) -> bool:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        entry = s._tasks.get(task_id)  # type: ignore[attr-defined]
+        if entry is not None and entry.started:
+            return True
+        time.sleep(0.002)
+    return False
+
+
+def _wait_pending(s: Scheduler, n: int) -> bool:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with s._cond:  # type: ignore[attr-defined]
+            if s._pending == n:  # type: ignore[attr-defined]
+                return True
+        time.sleep(0.002)
+    return False
 
 
 def _wait_accepted(s: Scheduler, n: int) -> bool:

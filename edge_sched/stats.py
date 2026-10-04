@@ -61,6 +61,7 @@ class Stats:
         self._accepted = 0
         self._completed = 0
         self._failed = 0
+        self._cancelled = 0
         self._rejected = 0
         self._queue_wait: List[float] = []
         self._total_latency: List[float] = []
@@ -72,6 +73,11 @@ class Stats:
     def record_rejected(self) -> None:
         with self._lock:
             self._rejected += 1
+
+    def record_cancelled(self) -> None:
+        """记录一个在开始执行前被取消的任务：计入 cancelled，无延迟样本。"""
+        with self._lock:
+            self._cancelled += 1
 
     def record_finished(self, queue_wait_ms: float, total_latency_ms: float,
                         success: bool) -> None:
@@ -91,6 +97,7 @@ class Stats:
                 accepted=self._accepted,
                 completed=self._completed,
                 failed=self._failed,
+                cancelled=self._cancelled,
                 rejected=self._rejected,
                 queue_wait_samples=list(self._queue_wait),
                 total_latency_samples=list(self._total_latency),
@@ -104,17 +111,20 @@ class StatsSnapshot:
         "accepted",
         "completed",
         "failed",
+        "cancelled",
         "rejected",
         "_queue_wait_samples",
         "_total_latency_samples",
     )
 
     def __init__(self, *, accepted: int, completed: int, failed: int,
-                 rejected: int, queue_wait_samples: List[float],
+                 cancelled: int, rejected: int,
+                 queue_wait_samples: List[float],
                  total_latency_samples: List[float]) -> None:
         self.accepted = accepted
         self.completed = completed
         self.failed = failed
+        self.cancelled = cancelled
         self.rejected = rejected
         self._queue_wait_samples = list(queue_wait_samples)
         self._total_latency_samples = list(total_latency_samples)
@@ -133,6 +143,7 @@ class StatsSnapshot:
             "accepted": self.accepted,
             "completed": self.completed,
             "failed": self.failed,
+            "cancelled": self.cancelled,
             "rejected": self.rejected,
             "queue_wait_ms": self.queue_wait_ms,
             "total_latency_ms": self.total_latency_ms,
@@ -141,9 +152,10 @@ class StatsSnapshot:
     def __repr__(self) -> str:  # pragma: no cover - 调试辅助
         return (
             "StatsSnapshot(accepted={a}, completed={c}, failed={f}, "
-            "rejected={r}, queue_wait_ms={qw}, total_latency_ms={tl})".format(
+            "cancelled={cn}, rejected={r}, queue_wait_ms={qw}, "
+            "total_latency_ms={tl})".format(
                 a=self.accepted, c=self.completed, f=self.failed,
-                r=self.rejected, qw=self.queue_wait_ms,
+                cn=self.cancelled, r=self.rejected, qw=self.queue_wait_ms,
                 tl=self.total_latency_ms,
             )
         )

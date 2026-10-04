@@ -23,6 +23,14 @@ class DuplicateTaskError(EdgeSchedError):
     """
 
 
+class TaskCancelledError(EdgeSchedError):
+    """任务在开始执行前被 :meth:`TaskHandle.cancel` 取消。
+
+    callable 完全不会执行；任务计入 accepted 与 cancelled，
+    但不计入 completed/failed，也不贡献延迟样本。
+    """
+
+
 class SchedulerClosedError(EdgeSchedError):
     """调度器已关闭，不再接受新任务。"""
 

@@ -7,8 +7,10 @@
 - 一个事件循环线程按入队顺序取出任务，在有空闲工作线程时派发到就绪队列。
 - 工作线程执行无参数 callable，记录排队/总延迟，唤醒等待方。
 - 未完成（已接受但未结束）任务数达到 ``max_pending`` 时触发背压拒绝。
+- 已接受但尚未开始执行的任务可通过 submit_nowait 返回的 TaskHandle.cancel
+  取消；取消与开始执行在同一把锁上决出唯一结果。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
-  已完成任务的结果在关闭后仍可读取。
+  已取消任务不阻塞关闭，已完成/已取消任务的结果在关闭后仍可读取。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from .errors import (
     DuplicateTaskError,
     InputValidationError,
     SchedulerClosedError,
+    TaskCancelledError,
 )
 from .stats import Stats, StatsSnapshot, to_ms
 
@@ -36,7 +39,15 @@ _DISPATCH_POLL = 0.05
 
 
 class _TaskEntry:
-    """一个任务的全部可变状态。"""
+    """一个任务的全部可变状态。
+
+    取消与执行的唯一裁决依赖两个受 Scheduler._cond 保护的标志：
+
+    - ``started``：工作线程已在锁内认领任务、即将执行 callable。
+    - ``cancelled``：任务已在锁内被取消，进入取消终态。
+
+    二者在同一把锁上以先到者为准，故每个任务只可能有一种终态。
+    """
 
     __slots__ = (
         "task_id",
@@ -46,6 +57,8 @@ class _TaskEntry:
         "success",
         "value",
         "exception",
+        "started",
+        "cancelled",
     )
 
     def __init__(self, task_id: str, fn: Callable[[], Any],
@@ -57,6 +70,8 @@ class _TaskEntry:
         self.success = False
         self.value: Any = None
         self.exception: Optional[BaseException] = None
+        self.started = False
+        self.cancelled = False
 
 
 class TaskHandle:
@@ -66,19 +81,34 @@ class TaskHandle:
     通过该句柄读到的仍是本次提交的结果。
     """
 
-    __slots__ = ("_entry",)
+    __slots__ = ("_scheduler", "_entry")
 
-    def __init__(self, entry: "_TaskEntry") -> None:
+    def __init__(self, scheduler: "Scheduler", entry: "_TaskEntry") -> None:
+        self._scheduler = scheduler
         self._entry = entry
 
     def done(self) -> bool:
-        """任务已结束（无论成功或失败）返回 True，否则 False。"""
+        """任务已结束（成功、失败或被取消）返回 True，否则 False。"""
         return self._entry.done.is_set()
+
+    def cancel(self) -> bool:
+        """尝试取消尚未开始执行的任务。
+
+        - 任务尚未开始：取消成功，callable 完全不执行，返回 True；
+          此后 :meth:`done` 为 True，:meth:`result` 抛
+          :class:`TaskCancelledError`。
+        - 任务已经开始执行或已有终态（含已被取消）：返回 False，
+          原终态与结果不受影响。
+
+        与“开始执行”竞争时，由调度器在同一原子边界决定唯一结果。
+        """
+        return self._scheduler._cancel(self._entry)
 
     def result(self, timeout: Optional[float] = None) -> Any:
         """等待并读取任务结果。
 
         - 成功：返回 callable 的返回值；失败：抛出 callable 抛出的原始异常。
+        - 被取消：抛出 :class:`TaskCancelledError`。
         - ``timeout`` 为 None 时一直等待；有限超时内未结束则抛
           :class:`TimeoutError`，任务本身继续执行，之后仍可再次读取结果。
         """
@@ -201,16 +231,18 @@ class Scheduler:
         :param fn: 无参数 callable。
         """
         entry = self._admit(task_id, fn)
-        return TaskHandle(entry)
+        return TaskHandle(self, entry)
 
     def result(self, task_id: str) -> Any:
         """读取一个已结束任务的结果（非阻塞）。
 
         - 成功：返回 callable 的返回值；失败：重新抛出其原始异常。
+        - 任务在开始前被取消：抛 :class:`TaskCancelledError`。
         - 任务尚未结束：抛 :class:`RuntimeError`。
         - 从未接受过该 task_id：抛 :class:`KeyError`。
 
-        调度器关闭后已完成任务的结果仍可通过本方法读取。
+        task_id 曾被复用时读取最近一次提交的结果；调度器关闭后
+        已结束任务的结果仍可通过本方法读取。
         """
         with self._cond:
             entry = self._tasks.get(task_id)
@@ -253,7 +285,8 @@ class Scheduler:
             while self._pending > 0:
                 self._cond.wait()
 
-        # 此时入站队列必为空，停止事件循环。
+        # pending 归零意味着没有未结束任务：入站队列中至多残留已取消任务
+        # 的惰性令牌（派发前会按 done 跳过），停止事件循环是安全的。
         self._stop_dispatcher.set()
         self._dispatcher.join()
 
@@ -302,29 +335,66 @@ class Scheduler:
             self._stats.record_accepted()
 
         # 入队在锁外：Queue 本身线程安全，入队顺序即接受顺序（FCFS）。
-        self._inbound.put(task_id)
+        # 队列携带条目本身而非 task_id：任务取消后 task_id 立即可被同名
+        # 新任务复用，旧令牌绝不能因此误取到新任务的条目。
+        self._inbound.put(entry)
         return entry
+
+    def _cancel(self, entry: "_TaskEntry") -> bool:
+        """取消一个已接受任务；仅在任务尚未开始执行时成功。
+
+        与工作线程的“认领”操作共用 _cond：认领置 started、取消置
+        cancelled，先到者在锁内决定唯一终态。取消成功即释放 pending
+        额度与 task_id 占用、计入 cancelled 并唤醒等待方。
+        """
+        with self._cond:
+            if entry.started or entry.cancelled or entry.done.is_set():
+                return False
+            entry.cancelled = True
+            entry.exception = TaskCancelledError(
+                "task %r was cancelled before it started" % (entry.task_id,)
+            )
+            self._pending -= 1
+            self._unfinished.discard(entry.task_id)
+            self._stats.record_cancelled()
+            self._cond.notify_all()
+        # done 在锁外置位：结果字段与计数在锁内已全部落定，
+        # 被唤醒的等待方只会读到一致的取消终态。
+        entry.done.set()
+        return True
 
     def _run_dispatcher(self) -> None:
         """事件循环：按 FCFS 顺序把任务派发给空闲工作线程。"""
         while not self._stop_dispatcher.is_set():
             try:
-                item = self._inbound.get(timeout=_DISPATCH_POLL)
+                entry = self._inbound.get(timeout=_DISPATCH_POLL)
             except queue.Empty:
+                continue
+            # 任务可能已在入站队列中等待期间被取消；取消条目不占用工作
+            # 线程许可，直接跳过即可（其终态已由 _cancel 落定）。
+            if entry.done.is_set():
                 continue
             # 取得一个空闲工作线程许可后再派发，保证就绪队列中至多有
             # workers 个待执行任务，且任务不会在就绪队列里无限堆积。
             self._worker_slots.acquire()
-            self._ready.put(item)
+            self._ready.put(entry)
 
     def _run_worker(self) -> None:
-        """工作线程：取任务 -> 执行 callable -> 记录统计 -> 唤醒等待方。"""
+        """工作线程：认领 -> 执行 callable -> 记录统计 -> 唤醒等待方。"""
         while True:
             item = self._ready.get()
             if item is _SENTINEL:
                 return
-            task_id = item
-            entry = self._tasks[task_id]
+            entry: "_TaskEntry" = item
+
+            # 原子认领：与 cancel 在同一把锁上决出唯一结果。
+            # 认领成功（置 started）后 callable 必执行到底，cancel 必失败；
+            # 已取消则 callable 绝不执行，立即归还许可。
+            with self._cond:
+                if entry.cancelled:
+                    self._worker_slots.release()
+                    continue
+                entry.started = True
 
             start_time = time.monotonic()
             try:
@@ -349,7 +419,7 @@ class Scheduler:
             )
             with self._cond:
                 self._pending -= 1
-                self._unfinished.discard(task_id)
+                self._unfinished.discard(entry.task_id)
                 self._cond.notify_all()
             entry.done.set()
 
