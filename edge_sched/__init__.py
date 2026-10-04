@@ -9,6 +9,7 @@
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
+  :class:`~edge_sched.errors.TaskCancelledError` /
   :class:`~edge_sched.errors.InputValidationError`
 """
 
@@ -18,6 +19,7 @@ from .errors import (
     EdgeSchedError,
     InputValidationError,
     SchedulerClosedError,
+    TaskCancelledError,
 )
 from .scheduler import Scheduler, TaskHandle
 from .stats import StatsSnapshot, percentile
@@ -31,6 +33,7 @@ __all__ = [
     "BackpressureError",
     "DuplicateTaskError",
     "SchedulerClosedError",
+    "TaskCancelledError",
     "InputValidationError",
 ]
 

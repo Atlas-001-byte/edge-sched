@@ -27,5 +27,13 @@ class SchedulerClosedError(EdgeSchedError):
     """调度器已关闭，不再接受新任务。"""
 
 
+class TaskCancelledError(EdgeSchedError):
+    """任务在开始执行前被取消，进入取消终态。
+
+    被取消的任务其 callable 完全不会执行；通过句柄或调度器读取结果时
+    抛出本异常。取消仅对尚未开始执行的任务生效。
+    """
+
+
 class InputValidationError(EdgeSchedError):
     """构造参数或 submit 参数未通过校验。"""

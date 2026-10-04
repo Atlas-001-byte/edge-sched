@@ -31,8 +31,9 @@ class StatsTest(unittest.TestCase):
     def test_empty_snapshot(self) -> None:
         snap = Stats().snapshot()
         self.assertEqual(
-            (snap.accepted, snap.completed, snap.failed, snap.rejected),
-            (0, 0, 0, 0),
+            (snap.accepted, snap.completed, snap.failed,
+             snap.cancelled, snap.rejected),
+            (0, 0, 0, 0, 0),
         )
         self.assertEqual(
             snap.queue_wait_ms,
@@ -55,10 +56,25 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(snap.accepted, 2)
         self.assertEqual(snap.completed, 1)
         self.assertEqual(snap.failed, 1)
+        self.assertEqual(snap.cancelled, 0)
         self.assertEqual(snap.rejected, 1)
         self.assertEqual(snap.queue_wait_ms["max"], 2.5)
         self.assertEqual(snap.total_latency_ms["max"], 9.0)
         self.assertEqual(snap.total_latency_ms["p50"], 5.25)
+
+    def test_cancelled_counted_without_samples(self) -> None:
+        stats = Stats()
+        stats.record_accepted()
+        stats.record_cancelled()
+
+        snap = stats.snapshot()
+        self.assertEqual(snap.accepted, 1)
+        self.assertEqual(snap.cancelled, 1)
+        self.assertEqual(snap.completed, 0)
+        self.assertEqual(snap.failed, 0)
+        # 取消不贡献任何延迟样本。
+        self.assertEqual(snap.queue_wait_ms["max"], 0.0)
+        self.assertEqual(snap.total_latency_ms["max"], 0.0)
 
     def test_snapshot_is_fixed(self) -> None:
         stats = Stats()
@@ -80,12 +96,13 @@ class StatsTest(unittest.TestCase):
         stats.record_finished(0.1236, 0.9994, success=True)
         d = stats.snapshot().to_dict()
         self.assertEqual(set(d), {
-            "accepted", "completed", "failed", "rejected",
+            "accepted", "completed", "failed", "cancelled", "rejected",
             "queue_wait_ms", "total_latency_ms",
         })
         # 毫秒保留三位小数。
         self.assertEqual(d["total_latency_ms"]["max"], 0.999)
         self.assertEqual(d["queue_wait_ms"]["max"], 0.124)
+        self.assertEqual(d["cancelled"], 0)
 
 
 if __name__ == "__main__":
