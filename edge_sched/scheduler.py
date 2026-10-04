@@ -17,9 +17,19 @@
 - 提交时可指定 max_queue_wait_ms 排队时限：按单调时钟从任务被接受计到
   工作线程原子认领，到期未认领的任务进入 expired 终态，callable 不执行；
   到期与认领、取消在同一把锁上裁决，每个任务只可能有一种终态。
+- submit_with_wait 在容量满时不立即拒绝，而是按发起先后排队等待名额：
+  到达 max_pending 上限后，等待中的调用严格按 FIFO 获得准入（每次释放只
+  唤醒并接纳队首），接纳后再按现有优先级与同级 FCFS 派发；等待期间同样
+  登记 task_id（同名提交抛 DuplicateTaskError）。admission_timeout_ms
+  为 None 时无限等待，0 时仅在有空位时接纳，其余为非负整数毫秒时限。
+  等待至时限仍无名额抛 BackpressureError（计入 rejected），close 开始时
+  尚未接纳者抛 SchedulerClosedError；两种拒绝都不创建任务、不执行
+  callable、不改变其余计数或延迟样本，并立即释放 task_id 占用。被接纳
+  任务的 max_queue_wait_ms 从实际接纳时刻起算。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
   已取消/已到期任务不阻塞关闭，已完成/已取消/已到期任务的结果在关闭后
-  仍可读取。
+  仍可读取。close 开始时尚在准入队列中等待的调用立即得到
+  SchedulerClosedError。
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import heapq
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Optional, TypeVar
 
 from .errors import (
@@ -98,6 +109,37 @@ class _TaskEntry:
         self.started = False
         self.cancelled = False
         self.expired = False
+
+
+class _AdmissionWaiter:
+    """submit_with_wait 在容量满时的一个等待者。
+
+    等待者在进入准入队列时即登记 task_id（与已接受任务共用同一套同名
+    校验），但此时尚未创建任务、未占用 pending 额度。所有字段都在
+    ``Scheduler._cond`` 锁内访问；``admitted`` 与 ``closed`` 是互斥的
+    唤醒原因，先到者在锁内决定该等待者的唯一结局。
+
+    被提升（获名额）的那一刻在锁内按 FIFO 顺序一次性预留接受序号
+    ``seq``、接纳时刻 ``admit_time``、pending 名额、accepted 计数并建好
+    任务条目 ``entry``：这样入站堆的同级 FCFS 顺序与排队时限的起算点都
+    锚定在真实接纳时刻，不随等待线程被调度唤醒的先后而改变。
+    """
+
+    __slots__ = (
+        "task_id", "fn", "priority", "max_queue_wait_ms",
+        "admitted", "closed", "entry",
+    )
+
+    def __init__(self, task_id: str, fn: Callable[[], Any],
+                 priority: int,
+                 max_queue_wait_ms: Optional[int]) -> None:
+        self.task_id = task_id
+        self.fn = fn
+        self.priority = priority
+        self.max_queue_wait_ms = max_queue_wait_ms
+        self.admitted = False
+        self.closed = False
+        self.entry: "Optional[_TaskEntry]" = None
 
 
 class TaskHandle:
@@ -184,6 +226,9 @@ class Scheduler:
         self._closed = False
         self._pending = 0
         self._unfinished: set[str] = set()
+        # submit_with_wait 的阻塞准入队列：队首是等待最久的调用。
+        # 等待者在入队时即占用 task_id，但不占 pending 额度、不产生任务。
+        self._admission_queue: "deque[_AdmissionWaiter]" = deque()
         # 全部已接受任务的条目长期保留，关闭后结果仍可读取。
         self._tasks: dict[str, _TaskEntry] = {}
 
@@ -222,6 +267,11 @@ class Scheduler:
     def _is_priority(value: Any) -> bool:
         # priority 接受任意整数（含负数），但 bool 不是合法优先级。
         return isinstance(value, int) and not isinstance(value, bool)
+
+    @staticmethod
+    def _is_nonneg_int(value: Any) -> bool:
+        # admission_timeout_ms 接受 0 与正整数，但 bool 非法。
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
     # ------------------------------------------------------------------ public
 
@@ -292,6 +342,72 @@ class Scheduler:
         entry = self._admit(task_id, fn, priority, max_queue_wait_ms)
         return TaskHandle(self, entry)
 
+    def submit_with_wait(self, task_id: str, fn: Callable[[], T],
+                         timeout: Optional[float] = None,
+                         priority: int = 0,
+                         max_queue_wait_ms: Optional[int] = None,
+                         admission_timeout_ms: Optional[int] = None) -> T:
+        """提交任务；容量满时按发起先后排队等待名额，再阻塞等待结果。
+
+        与 :meth:`submit` 参数语义一致并同样返回 callable 的结果，只额外
+        增加准入等待参数 ``admission_timeout_ms``:
+
+        - ``None``（缺省）：无空位时无限等待，直到获得名额。
+        - ``0``：仅在调用瞬间有空位时接纳，否则立即抛
+          :class:`BackpressureError`（语义同 :meth:`submit` 的满员拒绝）。
+        - 正整数：最多等待该毫秒数；到达时限仍未获名额抛
+          :class:`BackpressureError`。
+        只接受 None 或非负整数，布尔值与负数抛 :class:`InputValidationError`。
+
+        准入规则:
+
+        - 达到 ``max_pending`` 后，调用严格按发起先后（FIFO）排队；任何
+          成功、失败、取消或到期每释放一个名额，只唤醒并接纳队首一人，
+          随后该任务按现有“priority 降序、同优先级接受先后”派发，不抢占
+          执行中的任务。
+        - 等待期间即登记 task_id：与其他等待者或未完成任务同名的提交抛
+          :class:`DuplicateTaskError`，不入队、不占名额。
+        - 等待至准入时限：抛 :class:`BackpressureError`，该次拒绝计入
+          rejected；释放其 task_id 占用，不创建任务、不执行 callable、
+          不改变其余计数或延迟样本。
+        - :meth:`close` 开始时尚未被接纳的等待者抛
+          :class:`SchedulerClosedError`，同样不建任务、不执行 callable、
+          不计入 rejected。
+        - 一旦被接纳，``max_queue_wait_ms`` 从**实际接纳时刻**起算；其余
+          结果语义（成功原值、失败原异常、认领前到期
+          :class:`QueueTimeoutError`、等待结果 ``timeout``）与
+          :meth:`submit` 完全一致，callable 只执行一次。
+
+        :param admission_timeout_ms: 准入等待上限（毫秒），None 无限等待，
+            0 仅在有空位时接纳；只能为 None 或非负整数（bool 非法）。
+        """
+        if timeout is not None and timeout < 0:
+            raise InputValidationError(
+                "timeout must be >= 0 or None, got %r" % (timeout,)
+            )
+        if (admission_timeout_ms is not None
+                and not self._is_nonneg_int(admission_timeout_ms)):
+            raise InputValidationError(
+                "admission_timeout_ms must be a non-negative integer or None "
+                "(bool not allowed), got %r" % (admission_timeout_ms,)
+            )
+        self._validate_submit_args(task_id, fn, priority, max_queue_wait_ms)
+
+        with self._cond:
+            entry = self._admit_with_wait_locked(
+                task_id, fn, priority, max_queue_wait_ms,
+                admission_timeout_ms,
+            )
+
+        if not entry.done.wait(timeout):
+            raise TimeoutError(
+                "task %r did not finish within %s seconds" % (task_id, timeout)
+            )
+        if entry.success:
+            return entry.value  # type: ignore[no-any-return]
+        assert entry.exception is not None
+        raise entry.exception
+
     def result(self, task_id: str) -> Any:
         """读取一个已结束任务的结果（非阻塞）。
 
@@ -339,6 +455,14 @@ class Scheduler:
                 while not self._closed:
                     self._cond.wait()
                 return
+            # 关闭开始：准入队列中所有尚未获名额的等待者立即得到
+            # SchedulerClosedError。它们不占 pending 额度，释放其 task_id
+            # 占用；不计入 rejected，也不创建任何任务。
+            while self._admission_queue:
+                waiter = self._admission_queue.popleft()
+                waiter.closed = True
+                self._unfinished.discard(waiter.task_id)
+            self._cond.notify_all()
 
         # 等待全部已接受任务结束（关闭期间事件循环与工作线程照常运转）。
         with self._cond:
@@ -373,57 +497,200 @@ class Scheduler:
         submit 与 submit_nowait 共用；任何失败路径都不产生任务条目，
         除背压拒绝计入 rejected 外不改变统计。
         """
+        self._validate_submit_args(task_id, fn, priority, max_queue_wait_ms)
+
+        with self._cond:
+            # 登记与入堆在同一把锁内原子完成（锁序 _cond -> _inbound_cond），
+            # 使并发提交的同级 FCFS 顺序即接受顺序，不存在“已接受但尚未入堆”
+            # 被后来者越过的窗口。
+            entry = self._commit_admit_locked(
+                task_id, fn, priority, max_queue_wait_ms
+            )
+        return entry
+
+    @staticmethod
+    def _validate_submit_args(task_id: Any, fn: Any, priority: Any,
+                              max_queue_wait_ms: Any) -> None:
+        """submit / submit_nowait / submit_with_wait 共用的参数校验。"""
         if not isinstance(task_id, str) or task_id == "":
             raise InputValidationError(
                 "task_id must be a non-empty str, got %r" % (task_id,)
             )
         if not callable(fn):
             raise InputValidationError("fn must be callable, got %r" % (fn,))
-        if not self._is_priority(priority):
+        if not Scheduler._is_priority(priority):
             raise InputValidationError(
                 "priority must be an integer (bool not allowed), got %r"
                 % (priority,)
             )
         if (max_queue_wait_ms is not None
-                and not self._is_positive_int(max_queue_wait_ms)):
+                and not Scheduler._is_positive_int(max_queue_wait_ms)):
             raise InputValidationError(
                 "max_queue_wait_ms must be an integer >= 1 or None "
                 "(bool not allowed), got %r" % (max_queue_wait_ms,)
             )
 
-        with self._cond:
-            if self._closing:
-                raise SchedulerClosedError("scheduler is closed")
-            if task_id in self._unfinished:
-                raise DuplicateTaskError(
-                    "task_id %r is already pending" % (task_id,)
-                )
-            if self._pending >= self._max_pending:
-                self._stats.record_rejected()
-                raise BackpressureError(
-                    "pending task limit %d reached" % self._max_pending
-                )
+    def _commit_admit_locked(self, task_id: str, fn: Callable[[], Any],
+                             priority: int,
+                             max_queue_wait_ms: Optional[int]) -> "_TaskEntry":
+        """在容量可用时登记任务并入堆；调用时须持有 ``_cond``。
 
+        满员时立即计入 rejected 并抛 :class:`BackpressureError`（submit /
+        submit_nowait 的即时拒绝语义）。任何失败路径都不产生任务条目。
+
+        登记、计数与入入站堆在同一原子边界完成（锁序
+        _cond -> _inbound_cond）：并发提交一旦被接受，其令牌必已按接受
+        序号入堆，后来者无法在“已接受但未入堆”的窗口里越过它。
+        """
+        if self._closing:
+            raise SchedulerClosedError("scheduler is closed")
+        if task_id in self._unfinished:
+            raise DuplicateTaskError(
+                "task_id %r is already pending" % (task_id,)
+            )
+        if self._pending >= self._max_pending:
+            self._stats.record_rejected()
+            raise BackpressureError(
+                "pending task limit %d reached" % self._max_pending
+            )
+
+        seq = self._accept_seq
+        self._accept_seq += 1
+        entry = _TaskEntry(
+            task_id, fn, time.monotonic(), priority, seq,
+            max_queue_wait_ms,
+        )
+        self._tasks[task_id] = entry
+        self._unfinished.add(task_id)
+        self._pending += 1
+        self._stats.record_accepted()
+        self._enqueue_inbound_locked(entry, priority)
+        return entry
+
+    def _enqueue_inbound_locked(self, entry: "_TaskEntry",
+                                priority: int) -> None:
+        """把条目推入入站堆并唤醒事件循环；调用时须持有 ``_cond``。
+
+        本方法在持 ``_cond`` 时嵌套获取 ``_inbound_cond``（锁序
+        _cond -> _inbound_cond），使“接纳/提升”与“令牌入堆”对事件循环
+        原子可见。
+        """
+        with self._inbound_cond:
+            heapq.heappush(
+                self._inbound, (-priority, entry.seq, entry)
+            )
+            self._inbound_cond.notify()
+
+    def _admit_with_wait_locked(
+        self, task_id: str, fn: Callable[[], Any], priority: int,
+        max_queue_wait_ms: Optional[int],
+        admission_timeout_ms: Optional[int],
+    ) -> "_TaskEntry":
+        """submit_with_wait 的持锁准入：满员则在 FIFO 队列中等待名额。
+
+        调用时须持有 ``_cond``。等待者入队即登记 task_id（同名抛
+        DuplicateTaskError）；获名额后直接在锁内完成与 _admit 相同的
+        登记。等待至准入时限抛 BackpressureError（计入 rejected），
+        close 开始则抛 SchedulerClosedError；两种拒绝都移除等待者并
+        释放 task_id，不创建任务、不执行 callable。
+        """
+        if self._closing:
+            raise SchedulerClosedError("scheduler is closed")
+        if task_id in self._unfinished:
+            raise DuplicateTaskError(
+                "task_id %r is already pending" % (task_id,)
+            )
+
+        # 严格 FIFO：已有等待者时，即便有空位也先让队首获名额，新调用
+        # 不得插队。正常不变量下“有等待者即满员”，此处兜底处理空位
+        # 瞬态，避免后来者绕过队首或令队首无人唤醒。
+        if self._admission_queue:
+            self._promote_waiter_locked()
+
+        if (not self._admission_queue
+                and self._pending < self._max_pending):
+            # 调用瞬间有空位且无人排队：立即接纳（None 与 0 路径一致）。
+            return self._commit_admit_locked(
+                task_id, fn, priority, max_queue_wait_ms
+            )
+
+        # 0 = 只在有空位时接纳：不排队。
+        if admission_timeout_ms == 0:
+            self._stats.record_rejected()
+            raise BackpressureError(
+                "pending task limit %d reached" % self._max_pending
+            )
+
+        waiter = _AdmissionWaiter(task_id, fn, priority, max_queue_wait_ms)
+        self._admission_queue.append(waiter)
+        self._unfinished.add(task_id)
+
+        if admission_timeout_ms is None:
+            while not waiter.admitted and not waiter.closed:
+                self._cond.wait()
+        else:
+            deadline = time.monotonic() + admission_timeout_ms / 1000.0
+            while not waiter.admitted and not waiter.closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._cond.wait(remaining)
+
+        if waiter.admitted:
+            # 任务条目（含接受序号、接纳时刻、pending 名额与 accepted 计数）
+            # 已在提升那一刻由 _promote_waiter_locked 在锁内按 FIFO 建好。
+            assert waiter.entry is not None
+            return waiter.entry
+
+        # 被唤醒的原因是关闭（close 已整队清出），或等待自身超时：
+        # 仅当仍在队列中时移除自身。
+        if waiter in self._admission_queue:
+            self._admission_queue.remove(waiter)
+        self._unfinished.discard(task_id)
+        if waiter.closed:
+            raise SchedulerClosedError("scheduler is closed")
+        # 超时拒绝：若此刻恰有空位，把名额交给队首，再拒绝本次调用。
+        self._promote_waiter_locked()
+        self._stats.record_rejected()
+        raise BackpressureError(
+            "admission to scheduler timed out after %d ms"
+            % admission_timeout_ms
+        )
+
+    def _promote_waiter_locked(self) -> bool:
+        """若有空位且存在等待者，把队首提升为已接纳并在锁内建好任务。
+
+        调用时须持有 ``_cond``。提升是真正的接纳时刻：此处一次性按 FIFO
+        预留接受序号、记录接纳时刻（max_queue_wait_ms 起算点）、占用
+        pending 名额、登记 task_id/任务条目、计入 accepted，并把令牌原子
+        推入入站堆（锁序 _cond -> _inbound_cond）。因此这些结果既不依赖
+        等待线程之后被调度唤醒的先后，也不存在“已接纳但未入堆”被后来者
+        越过的窗口。返回是否提升了一个等待者；一次释放只提升队首一人。
+        """
+        while self._admission_queue:
+            waiter = self._admission_queue.popleft()
+            if waiter.closed:
+                # close 唤醒途中残留的等待者不会出现（关闭时整队列出队），
+                # 这里仅作防御性跳过。
+                continue
+            if self._pending >= self._max_pending:
+                self._admission_queue.appendleft(waiter)
+                return False
             seq = self._accept_seq
             self._accept_seq += 1
             entry = _TaskEntry(
-                task_id, fn, time.monotonic(), priority, seq,
-                max_queue_wait_ms,
+                waiter.task_id, waiter.fn, time.monotonic(),
+                waiter.priority, seq, waiter.max_queue_wait_ms,
             )
-            self._tasks[task_id] = entry
-            self._unfinished.add(task_id)
+            waiter.entry = entry
+            self._tasks[waiter.task_id] = entry
             self._pending += 1
             self._stats.record_accepted()
-
-        # 入堆在 _cond 锁外：堆由 _inbound_cond 单独保护，入堆顺序由
-        # 单调递增的接受序号承载。堆携带条目本身而非 task_id：任务取消后
-        # task_id 立即可被同名新任务复用，旧令牌绝不能因此误取到新条目。
-        with self._inbound_cond:
-            heapq.heappush(
-                self._inbound, (-priority, seq, entry)
-            )
-            self._inbound_cond.notify()
-        return entry
+            self._enqueue_inbound_locked(entry, waiter.priority)
+            waiter.admitted = True
+            self._cond.notify_all()
+            return True
+        return False
 
     def _cancel(self, entry: "_TaskEntry") -> bool:
         """取消一个已接受任务；仅在任务尚未开始执行且未到期时成功。
@@ -443,6 +710,9 @@ class Scheduler:
             self._pending -= 1
             self._unfinished.discard(entry.task_id)
             self._stats.record_cancelled()
+            # 名额释放：若有 submit_with_wait 等待者，在锁内直接把队首
+            # 提升为已接纳（预占新空出的名额），一次释放只接纳一人。
+            self._promote_waiter_locked()
             self._cond.notify_all()
         # done 在锁外置位：结果字段与计数在锁内已全部落定，
         # 被唤醒的等待方只会读到一致的取消终态。
@@ -467,6 +737,8 @@ class Scheduler:
         self._pending -= 1
         self._unfinished.discard(entry.task_id)
         self._stats.record_expired()
+        # 到期同样释放名额：一次释放只把队首等待者提升为已接纳。
+        self._promote_waiter_locked()
         self._cond.notify_all()
         return True
 
@@ -488,20 +760,30 @@ class Scheduler:
         while self._inbound and self._inbound[0][2].done.is_set():
             heapq.heappop(self._inbound)
 
-    def _expire_due_locked(self) -> None:
-        """把堆中已逾认领截止时刻的任务置入到期终态；调用时须持有
+    def _collect_due_locked(self) -> "list[_TaskEntry]":
+        """收集堆中已逾认领截止时刻、尚未结束的任务；调用时须持有
         ``_inbound_cond``。
 
-        到期条目留在堆中作为惰性令牌，由剪枝/弹出逻辑丢弃；本方法负责
-        在到期时刻立即释放 pending 额度与 task_id、落定终态并唤醒等待方，
-        使到期不依赖新提交或工作线程空位。锁序为 _inbound_cond -> _cond
-        （_cond 的持锁路径从不反取 _inbound_cond，故无环）。
+        只收集、不改状态：到期裁决（_expire）会获取 ``_cond``，而全局锁序
+        是 _cond -> _inbound_cond，故不能在持有 ``_inbound_cond`` 时反取
+        ``_cond``。调用方在释放 ``_inbound_cond`` 后逐个调用 :meth:`_expire`。
         """
         now = time.monotonic()
-        for _, _, entry in self._inbound:
-            if (entry.deadline is not None and now >= entry.deadline
-                    and not entry.done.is_set()):
-                self._expire(entry)
+        return [
+            entry
+            for _, _, entry in self._inbound
+            if entry.deadline is not None and now >= entry.deadline
+            and not entry.done.is_set()
+        ]
+
+    def _expire_entries(self, entries: "list[_TaskEntry]") -> None:
+        """在不持有 ``_inbound_cond`` 的情况下，对收集到的到期任务逐个裁决。
+
+        去重后调用 :meth:`_expire`（其内部获取 ``_cond``），符合全局锁序
+        _cond -> _inbound_cond；重复条目的第二次裁决幂等失败。
+        """
+        for entry in set(entries):
+            self._expire(entry)
 
     def _deadline_wait_locked(self) -> float:
         """返回到最近一次认领截止时刻的等待秒数（上限 _DISPATCH_POLL）。
@@ -548,15 +830,23 @@ class Scheduler:
         while not self._stop_dispatcher.is_set():
             with self._inbound_cond:
                 self._prune_cancelled_locked()
-                self._expire_due_locked()
+                due = self._collect_due_locked()
                 while (not self._stop_dispatcher.is_set()
                        and not self._inbound):
                     self._inbound_cond.wait(_DISPATCH_POLL)
                     self._prune_cancelled_locked()
-                    self._expire_due_locked()
+                    due = self._collect_due_locked()
                 if self._stop_dispatcher.is_set():
-                    return
-                wait = self._deadline_wait_locked()
+                    stopping = True
+                else:
+                    stopping = False
+                    wait = self._deadline_wait_locked()
+
+            # 到期裁决需要 _cond，放到 _inbound_cond 之外进行（锁序
+            # _cond -> _inbound_cond），避免持 _inbound_cond 反取 _cond。
+            self._expire_entries(due)
+            if stopping:
+                return
 
             # 取得一个空闲工作线程许可后再选取任务，保证选出的任务立即
             # 有线程可以执行；就绪队列中至多有 workers 个待执行任务。
@@ -567,7 +857,9 @@ class Scheduler:
                 self._worker_slots.release()
                 return
             with self._inbound_cond:
-                self._expire_due_locked()
+                due = self._collect_due_locked()
+            self._expire_entries(due)
+            with self._inbound_cond:
                 entry = self._pop_next_locked()
             if entry is None:
                 # 等待许可期间堆中的任务已全部被取消/到期：归还许可继续循环。
@@ -627,6 +919,8 @@ class Scheduler:
             with self._cond:
                 self._pending -= 1
                 self._unfinished.discard(entry.task_id)
+                # 成功/失败释放名额：一次释放只接纳准入队列队首一人。
+                self._promote_waiter_locked()
                 self._cond.notify_all()
             entry.done.set()
 

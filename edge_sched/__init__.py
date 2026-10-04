@@ -6,6 +6,8 @@
 - :func:`~edge_sched.scheduler.Scheduler.submit` -- 提交任务并等待结果。
 - :func:`~edge_sched.scheduler.Scheduler.submit_nowait` -- 非阻塞提交，返回
   :class:`~edge_sched.scheduler.TaskHandle`。
+- :func:`~edge_sched.scheduler.Scheduler.submit_with_wait` -- 容量满时按
+  发起先后排队等待名额（可带 admission_timeout_ms），再等待结果。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /

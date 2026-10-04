@@ -21,6 +21,21 @@
   发生则执行到底。到期任务计入 `accepted` 与新增的 `expired` 统计，不
   贡献延迟样本；CLI 任务可提供 `max_queue_wait_ms` 字段，到期任务的
   结果对象只含 `task_id` 与 `error`（固定为 `"QueueTimeoutError"`）。
+- 增量：有界阻塞准入。新增 `Scheduler.submit_with_wait`，沿用 `submit`
+  的参数位置与结果语义（成功返回原值、失败抛原异常、callable 只执行
+  一次），只在末尾增加 `admission_timeout_ms`：`None`（缺省）无限等待，
+  `0` 只在调用瞬间有空位时接纳，其他值必须是非负整数毫秒（`bool`、负数
+  非法），参数非法抛 `InputValidationError`。达到 `max_pending` 后调用按
+  发起先后 FIFO 排队，等待期间即登记 task_id（同名提交抛
+  `DuplicateTaskError`）；成功、失败、取消或到期每释放一个名额只接纳队首
+  一人，再按现有“priority 降序、同级接受先后”派发，不抢占执行中任务。
+  容量不足直到准入时限抛 `BackpressureError`（计入 `rejected`），`close`
+  开始时尚未接纳者抛 `SchedulerClosedError`（不计 `rejected`）；二者都
+  释放标识、不创建任务、不执行 callable、不改变其他计数或延迟样本。被
+  接纳任务的 `max_queue_wait_ms` 从实际接纳时刻起算，认领前到期仍抛
+  `QueueTimeoutError` 并计入 `expired`。`TaskHandle.result`、
+  `Scheduler.result` 与 `snapshot` 的既有结果、计数及两类延迟分位不变；
+  现有公开入口与 CLI 不变。
 
 ## 约定
 
