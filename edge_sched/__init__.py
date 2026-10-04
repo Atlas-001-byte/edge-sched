@@ -4,6 +4,8 @@
 
 - :class:`~edge_sched.scheduler.Scheduler` -- 调度器入口。
 - :func:`~edge_sched.scheduler.Scheduler.submit` -- 提交任务并等待结果。
+- :func:`~edge_sched.scheduler.Scheduler.submit_with_wait` -- 容量不足时
+  按发起先后排队等待准入，再等待结果。
 - :func:`~edge_sched.scheduler.Scheduler.submit_nowait` -- 非阻塞提交，返回
   :class:`~edge_sched.scheduler.TaskHandle`。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。

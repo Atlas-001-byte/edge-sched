@@ -1156,6 +1156,260 @@ class QueueTimeoutTest(unittest.TestCase):
         self.assertEqual(len(_samples(snap, "total")), finished)
 
 
+class SubmitWithWaitTest(unittest.TestCase):
+    """submit_with_wait 的有界阻塞准入语义。"""
+
+    @staticmethod
+    def _occupy(release: threading.Event,
+                started: threading.Event) -> "Any":
+        def fn() -> str:
+            started.set()
+            release.wait(2.0)
+            return "occ"
+        return fn
+
+    @staticmethod
+    def _capture(errors: "list[BaseException]", fn: "Any", *args: "Any",
+                 **kwargs: "Any") -> None:
+        try:
+            fn(*args, **kwargs)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def test_ordered_admission(self) -> None:
+        # 单名额被占住时三个调用按发起先后排队；每次释放只接纳队首，
+        # 单工作线程下执行顺序即准入顺序。
+        release = threading.Event()
+        started = threading.Event()
+        order: list[str] = []
+        lock = threading.Lock()
+
+        with Scheduler(workers=1, max_pending=1) as s:
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+
+            def make_fn(tid: str) -> "Any":
+                def fn() -> str:
+                    with lock:
+                        order.append(tid)
+                    return tid
+                return fn
+
+            results: dict[str, str] = {}
+            threads = []
+            for i in range(3):
+                tid = "w%d" % i
+                t = threading.Thread(
+                    target=lambda tid=tid: results.setdefault(
+                        tid, s.submit_with_wait(tid, make_fn(tid)))
+                )
+                t.start()
+                threads.append(t)
+                # 等该调用确实进入等待队列后再发起下一个，保证入队顺序。
+                self.assertTrue(_wait_waiting(s, tid))
+            # 等待中的调用不创建任务、不计入 accepted。
+            self.assertEqual(s.snapshot().accepted, 1)
+
+            release.set()
+            for t in threads:
+                t.join(2.0)
+                self.assertFalse(t.is_alive())
+            self.assertEqual(results, {"w0": "w0", "w1": "w1", "w2": "w2"})
+            self.assertEqual(order, ["w0", "w1", "w2"])
+
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 4)
+        self.assertEqual(snap.completed, 4)
+        self.assertEqual(snap.rejected, 0)
+
+    def test_admission_timeout(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        ran: list[int] = []
+        with Scheduler(workers=1, max_pending=1) as s:
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+
+            with self.assertRaises(BackpressureError):
+                s.submit_with_wait("w", lambda: ran.append(1),
+                                   admission_timeout_ms=50)
+            # 超时拒绝：计入 rejected，但不创建任务、不执行 callable、
+            # 不影响其他计数。
+            self.assertEqual(ran, [])
+            self.assertNotIn("w", s._tasks)  # type: ignore[attr-defined]
+            snap = s.snapshot()
+            self.assertEqual(snap.accepted, 1)
+            self.assertEqual(snap.rejected, 1)
+
+            # task_id 登记已释放：名额可用后可同名再提交。
+            release.set()
+            self.assertTrue(_wait_pending(s, 0))
+            self.assertEqual(s.submit("w", lambda: "ok"), "ok")
+
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 2)
+        self.assertEqual(snap.completed, 2)
+        self.assertEqual(snap.rejected, 1)
+
+    def test_zero_admission_timeout(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        with Scheduler(workers=1, max_pending=1) as s:
+            # 有空位：admission_timeout_ms=0 立即接纳并返回结果。
+            self.assertEqual(
+                s.submit_with_wait("a", lambda: 7, admission_timeout_ms=0), 7
+            )
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+            # 无空位：不等待，立即按背压拒绝。
+            with self.assertRaises(BackpressureError):
+                s.submit_with_wait("b", lambda: None, admission_timeout_ms=0)
+            self.assertEqual(s.snapshot().rejected, 1)
+            release.set()
+
+    def test_close_fails_waiting(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        ran: list[int] = []
+        s = Scheduler(workers=1, max_pending=1)
+        s.submit_nowait("occ", self._occupy(release, started))
+        self.assertTrue(started.wait(2.0))
+
+        errors: list[BaseException] = []
+        t = threading.Thread(
+            target=lambda: self._capture(
+                errors, s.submit_with_wait, "w", lambda: ran.append(1))
+        )
+        t.start()
+        self.assertTrue(_wait_waiting(s, "w"))
+
+        closer = threading.Thread(target=s.close)
+        closer.start()
+        # close 开始即令未接纳的等待者失败，不等占用中的任务结束。
+        t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SchedulerClosedError)
+        # 关闭拒绝：释放标识、不创建任务、不执行 callable、不计入任何统计。
+        self.assertEqual(ran, [])
+        self.assertNotIn("w", s._tasks)  # type: ignore[attr-defined]
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 1)
+        self.assertEqual(snap.rejected, 0)
+
+        release.set()
+        closer.join(2.0)
+        self.assertFalse(closer.is_alive())
+
+    def test_duplicate_while_waiting(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        with Scheduler(workers=1, max_pending=1) as s:
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+
+            results: dict[str, str] = {}
+            t = threading.Thread(
+                target=lambda: results.setdefault(
+                    "w", s.submit_with_wait("w", lambda: "done"))
+            )
+            t.start()
+            self.assertTrue(_wait_waiting(s, "w"))
+
+            # 等待期间 task_id 已登记：三种入口的同名提交都判重。
+            with self.assertRaises(DuplicateTaskError):
+                s.submit("w", lambda: None)
+            with self.assertRaises(DuplicateTaskError):
+                s.submit_nowait("w", lambda: None)
+            with self.assertRaises(DuplicateTaskError):
+                s.submit_with_wait("w", lambda: None, admission_timeout_ms=0)
+
+            release.set()
+            t.join(2.0)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(results.get("w"), "done")
+
+    def test_validation(self) -> None:
+        with Scheduler(workers=1, max_pending=1) as s:
+            for bad in (-1, -100, True, False, 1.5, 0.0, "10"):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(InputValidationError):
+                        s.submit_with_wait(
+                            "t", lambda: None,
+                            admission_timeout_ms=bad,  # type: ignore[arg-type]
+                        )
+            with self.assertRaises(InputValidationError):
+                s.submit_with_wait("t", lambda: None, timeout=-1)
+            # 与 submit 共有的参数校验同样生效。
+            with self.assertRaises(InputValidationError):
+                s.submit_with_wait("", lambda: None)
+            with self.assertRaises(InputValidationError):
+                s.submit_with_wait("t", None)  # type: ignore[arg-type]
+            with self.assertRaises(InputValidationError):
+                s.submit_with_wait("t", lambda: None, priority=True)
+            with self.assertRaises(InputValidationError):
+                s.submit_with_wait("t", lambda: None, max_queue_wait_ms=0)
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 0)
+        self.assertEqual(snap.rejected, 0)
+
+    def test_waited_task_failure_raises_original(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        with Scheduler(workers=1, max_pending=1) as s:
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+
+            def boom() -> None:
+                raise ValueError("x")
+
+            errors: list[BaseException] = []
+            t = threading.Thread(
+                target=lambda: self._capture(
+                    errors, s.submit_with_wait, "w", boom)
+            )
+            t.start()
+            self.assertTrue(_wait_waiting(s, "w"))
+            release.set()
+            t.join(2.0)
+            self.assertFalse(t.is_alive())
+            # 获容后失败原样抛原异常，且 callable 只执行一次。
+            self.assertEqual(len(errors), 1)
+            self.assertIs(type(errors[0]), ValueError)
+            self.assertEqual(str(errors[0]), "x")
+
+        snap = s.snapshot()
+        self.assertEqual(snap.completed, 1)
+        self.assertEqual(snap.failed, 1)
+
+    def test_queue_wait_starts_at_admission(self) -> None:
+        # max_queue_wait_ms 从接纳时刻（而非发起调用时刻）起算：等待
+        # 200ms 后才获容，若从发起时刻起算 150ms 的排队时限早已逾期。
+        release = threading.Event()
+        started = threading.Event()
+        with Scheduler(workers=1, max_pending=1) as s:
+            s.submit_nowait("occ", self._occupy(release, started))
+            self.assertTrue(started.wait(2.0))
+
+            results: dict[str, str] = {}
+            t = threading.Thread(
+                target=lambda: results.setdefault(
+                    "w", s.submit_with_wait("w", lambda: "ran",
+                                            max_queue_wait_ms=150))
+            )
+            t.start()
+            self.assertTrue(_wait_waiting(s, "w"))
+            time.sleep(0.2)
+            release.set()
+            t.join(2.0)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(results.get("w"), "ran")
+
+        snap = s.snapshot()
+        self.assertEqual(snap.expired, 0)
+        self.assertEqual(snap.completed, 2)
+
+
 def _wait_started(s: Scheduler, task_id: str) -> bool:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -1171,6 +1425,16 @@ def _wait_pending(s: Scheduler, n: int) -> bool:
     while time.monotonic() < deadline:
         with s._cond:  # type: ignore[attr-defined]
             if s._pending == n:  # type: ignore[attr-defined]
+                return True
+        time.sleep(0.002)
+    return False
+
+
+def _wait_waiting(s: Scheduler, task_id: str) -> bool:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with s._cond:  # type: ignore[attr-defined]
+            if task_id in s._waiting_ids:  # type: ignore[attr-defined]
                 return True
         time.sleep(0.002)
     return False
