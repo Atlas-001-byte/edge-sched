@@ -36,6 +36,22 @@
   `QueueTimeoutError` 并计入 `expired`。`TaskHandle.result`、
   `Scheduler.result` 与 `snapshot` 的既有结果、计数及两类延迟分位不变；
   现有公开入口与 CLI 不变。
+- 增量：区间统计观测。新增不可变 `StatsCheckpoint`（已导出到
+  `edge_sched` 公开命名空间）与 `Scheduler.stats_checkpoint`、
+  `Scheduler.snapshot_since`。checkpoint 只能由对应调度器创建；
+  `snapshot_since` 返回 `StatsSnapshot`，字段、分位口径与 `to_dict`
+  形态与 `snapshot` 一致。创建 checkpoint 与统计事件在同一把锁的原子
+  顺序上裁决：`accepted`/`rejected`/`cancelled`/`expired` 按接纳、拒绝、
+  取消、到期时刻归属，`completed`/`failed` 与两类延迟样本按结束时刻
+  归属；跨边界任务在接纳区间计 `accepted`，在结束区间计 `completed` 或
+  `failed` 并贡献 `queue_wait_ms`/`total_latency_ms` 样本，边界前的事件
+  不计入。`queue_wait_ms` 与 `total_latency_ms` 只收集边界后成功或失败
+  结束的任务样本；空区间六项计数全为 0，两个分布的 p50/p95/p99/max
+  均为 0.0。同一 checkpoint 可反复查询，不改变累计统计或后续区间；
+  `snapshot`、`TaskHandle.result`、`Scheduler.result`、提交入口、关闭后
+  结果读取与 CLI 的输出和异常语义不变。调度器关闭后仍可创建 checkpoint、
+  查询历史统计；传入非 `StatsCheckpoint`、其他调度器的 checkpoint 或损坏
+  对象时抛 `InputValidationError`，且不改变计数、延迟样本或任务状态。
 
 ## 约定
 

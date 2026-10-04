@@ -514,6 +514,407 @@ class SnapshotLatencyTest(unittest.TestCase):
         )
 
 
+_EMPTY_DIST = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+
+
+class StatsCheckpointTest(unittest.TestCase):
+    def test_empty_interval_right_after_checkpoint(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            cp = s.stats_checkpoint()
+            interval = s.snapshot_since(cp)
+            self.assertEqual(
+                (interval.accepted, interval.completed, interval.failed,
+                 interval.cancelled, interval.expired, interval.rejected),
+                (0, 0, 0, 0, 0, 0),
+            )
+            self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
+            self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
+            self.assertEqual(set(interval.to_dict()),
+                             set(s.snapshot().to_dict()))
+
+    def test_interval_collects_only_later_events(self) -> None:
+        with Scheduler(workers=2, max_pending=4) as s:
+            self.assertEqual(s.submit("before", lambda: 1), 1)
+            cp = s.stats_checkpoint()
+            self.assertEqual(s.submit("after", lambda: 2), 2)
+
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.accepted, 1)
+            self.assertEqual(interval.completed, 1)
+            self.assertEqual(len(_samples(interval, "wait")), 1)
+            self.assertEqual(len(_samples(interval, "total")), 1)
+            # 累计 snapshot 仍是两个任务。
+            total = s.snapshot()
+            self.assertEqual(total.accepted, 2)
+            self.assertEqual(total.completed, 2)
+
+    def test_cross_boundary_task_split_by_moments(self) -> None:
+        # 边界前接纳、边界后结束：accepted 不计入区间，completed 与两类
+        # 延迟样本计入区间。
+        release = threading.Event()
+
+        def wait_then_done() -> None:
+            release.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            handle = s.submit_nowait("span", wait_then_done)
+            self.assertTrue(_wait_accepted(s, 1))
+            cp = s.stats_checkpoint()
+            release.set()
+            self.assertIsNone(handle.result(2.0))
+
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.accepted, 0)
+            self.assertEqual(interval.completed, 1)
+            self.assertEqual(interval.failed, 0)
+            self.assertEqual(len(_samples(interval, "wait")), 1)
+            self.assertEqual(len(_samples(interval, "total")), 1)
+        # 区间快照在调度器关闭后仍可复算，值不变。
+        self.assertEqual(interval.completed, 1)
+
+    def test_cross_boundary_failure_counts_failed_after(self) -> None:
+        release = threading.Event()
+
+        def boom() -> None:
+            release.wait(2.0)
+            raise ValueError("late")
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            s.submit_nowait("span", boom)
+            self.assertTrue(_wait_accepted(s, 1))
+            cp = s.stats_checkpoint()
+            release.set()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if s.snapshot().failed == 1:
+                    break
+                time.sleep(0.005)
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.accepted, 0)
+            self.assertEqual(interval.failed, 1)
+            self.assertEqual(interval.completed, 0)
+            self.assertEqual(len(_samples(interval, "total")), 1)
+
+    def test_two_boundaries_split_accept_and_finish(self) -> None:
+        # 接纳落在第一区间，结束落在第二区间：跨区间任务在接纳区间计
+        # accepted，在结束区间计 completed。
+        release = threading.Event()
+
+        def wait_then_done() -> None:
+            release.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            cp0 = s.stats_checkpoint()
+            handle = s.submit_nowait("span", wait_then_done)
+            self.assertTrue(_wait_accepted(s, 1))
+            cp1 = s.stats_checkpoint()
+            # 任务尚未结束时取第一区间快照：只有 accepted、没有完成样本。
+            first = s.snapshot_since(cp0)
+            self.assertEqual((first.accepted, first.completed), (1, 0))
+            self.assertEqual(len(_samples(first, "total")), 0)
+            release.set()
+            handle.result(2.0)
+
+            # 早先取得的快照对象固定不变；重新查询同一边界得到增长后的
+            # 区间（边界->此刻），结束事件落在 cp1 之后。
+            self.assertEqual((first.accepted, first.completed), (1, 0))
+            first_grown = s.snapshot_since(cp0)
+            second = s.snapshot_since(cp1)
+            self.assertEqual(
+                (first_grown.accepted, first_grown.completed), (1, 1)
+            )
+            self.assertEqual(
+                (second.accepted, second.completed), (0, 1)
+            )
+            self.assertEqual(len(_samples(first, "total")), 0)
+            self.assertEqual(len(_samples(second, "total")), 1)
+            # 区间代数：(cp0, cp1] 与 (cp1, 此刻] 不重不漏覆盖 (cp0, 此刻]。
+            self.assertEqual(
+                first.accepted + second.accepted, first_grown.accepted
+            )
+            self.assertEqual(
+                first.completed + second.completed, first_grown.completed
+            )
+
+    def test_cancel_after_boundary_counts_in_interval(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=4) as s:
+            running = s.submit_nowait("run", lambda: release.wait(2.0))
+            self.assertTrue(_wait_accepted(s, 1))
+            queued = s.submit_nowait("q", lambda: None)
+            # 等 queued 进入入站堆但尚未被认领。
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if s.snapshot().accepted == 2:
+                    break
+                time.sleep(0.005)
+            cp = s.stats_checkpoint()
+            self.assertTrue(queued.cancel())
+
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.accepted, 0)
+            self.assertEqual(interval.cancelled, 1)
+            self.assertEqual(len(_samples(interval, "wait")), 0)
+            release.set()
+            running.result(2.0)
+
+    def test_expired_after_boundary_counts_in_interval(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=4) as s:
+            running = s.submit_nowait("run", lambda: release.wait(2.0))
+            self.assertTrue(_wait_accepted(s, 1))
+            s.submit_nowait("q", lambda: None, max_queue_wait_ms=30)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if s.snapshot().accepted == 2:
+                    break
+                time.sleep(0.005)
+            cp = s.stats_checkpoint()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if s.snapshot_since(cp).expired == 1:
+                    break
+                time.sleep(0.005)
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.accepted, 0)
+            self.assertEqual(interval.expired, 1)
+            self.assertEqual(len(_samples(interval, "wait")), 0)
+            release.set()
+            running.result(2.0)
+
+    def test_rejected_after_boundary_counts_in_interval(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=1) as s:
+            handle = s.submit_nowait("only", lambda: release.wait(2.0))
+            self.assertTrue(_wait_accepted(s, 1))
+            cp = s.stats_checkpoint()
+            with self.assertRaises(BackpressureError):
+                s.submit("overflow", lambda: None)
+            interval = s.snapshot_since(cp)
+            self.assertEqual(interval.rejected, 1)
+            self.assertEqual(interval.accepted, 0)
+            release.set()
+            handle.result(2.0)
+
+    def test_repeated_query_is_stable(self) -> None:
+        with Scheduler(workers=1, max_pending=2) as s:
+            cp = s.stats_checkpoint()
+            s.submit("a", lambda: None)
+            first = s.snapshot_since(cp)
+            s.submit("b", lambda: None)
+            second = s.snapshot_since(cp)
+            third = s.snapshot_since(cp)
+            # 同一 checkpoint 反复查询：早先结果固定，后续查询也不改变累计。
+            self.assertEqual((first.accepted, first.completed), (1, 1))
+            self.assertEqual((second.accepted, second.completed), (2, 2))
+            self.assertEqual((third.accepted, third.completed), (2, 2))
+            self.assertEqual(s.snapshot().accepted, 2)
+
+    def test_checkpoint_and_query_after_close(self) -> None:
+        s = Scheduler(workers=2, max_pending=4)
+        early_cp = s.stats_checkpoint()
+        self.assertEqual(s.submit("a", lambda: 1), 1)
+        s.close()
+
+        # 关闭后仍可创建边界、查询历史统计。
+        late_cp = s.stats_checkpoint()
+        self.assertEqual(s.snapshot_since(early_cp).accepted, 1)
+        self.assertEqual(s.snapshot_since(early_cp).completed, 1)
+        tail = s.snapshot_since(late_cp)
+        self.assertEqual(tail.accepted, 0)
+        self.assertEqual(tail.completed, 0)
+        self.assertEqual(tail.queue_wait_ms, _EMPTY_DIST)
+        # 已结束任务结果在关闭后照常读取。
+        self.assertEqual(s.result("a"), 1)
+
+    def test_invalid_checkpoint_raises_input_validation(self) -> None:
+        from edge_sched import StatsCheckpoint, StatsSnapshot
+        from edge_sched.stats import Stats
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            s.submit("a", lambda: None)
+            for bad in (None, 1, "cp", object(), (), [],
+                        StatsSnapshot(
+                            accepted=0, completed=0, failed=0,
+                            cancelled=0, expired=0, rejected=0,
+                            queue_wait_samples=[], total_latency_samples=[],
+                        )):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(InputValidationError):
+                        s.snapshot_since(bad)  # type: ignore[arg-type]
+
+            other = Scheduler(workers=1, max_pending=2)
+            try:
+                foreign = other.stats_checkpoint()
+                with self.assertRaises(InputValidationError):
+                    s.snapshot_since(foreign)
+                # 底层 Stats 直接构造的边界同样不属于本调度器。
+                stranger = Stats().checkpoint()
+                with self.assertRaises(InputValidationError):
+                    s.snapshot_since(stranger)
+            finally:
+                other.close()
+
+            # 损坏对象：缺字段、字段类型被篡改。
+            broken = StatsCheckpoint.__new__(StatsCheckpoint)
+            with self.assertRaises(InputValidationError):
+                s.snapshot_since(broken)
+            bad_owner = StatsCheckpoint.__new__(StatsCheckpoint)
+            object.__setattr__(bad_owner, "_checkpoint_id", 0)
+            object.__setattr__(bad_owner, "_owner", object())
+            with self.assertRaises(InputValidationError):
+                s.snapshot_since(bad_owner)
+            bad_id = StatsCheckpoint.__new__(StatsCheckpoint)
+            object.__setattr__(bad_id, "_owner", s._stats)
+            object.__setattr__(bad_id, "_checkpoint_id", "0")
+            with self.assertRaises(InputValidationError):
+                s.snapshot_since(bad_id)
+
+            # 全部拒绝都不改变计数或任务状态。
+            total = s.snapshot()
+            self.assertEqual(total.accepted, 1)
+            self.assertEqual(total.completed, 1)
+            self.assertEqual(s.result("a"), None)
+
+    def test_checkpoint_is_exported_and_immutable(self) -> None:
+        from edge_sched import StatsCheckpoint as PublicCheckpoint
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            cp = s.stats_checkpoint()
+            self.assertIsInstance(cp, PublicCheckpoint)
+            with self.assertRaises(AttributeError):
+                cp._checkpoint_id = 99  # type: ignore[misc]
+            with self.assertRaises(AttributeError):
+                cp.new_field = 1  # type: ignore[misc]
+
+    def test_concurrent_checkpoints_partition_without_gap_or_dup(self) -> None:
+        workers = 4
+        per_thread = 120
+        submitters = 6
+        with Scheduler(workers=workers,
+                       max_pending=submitters * per_thread + 8) as s:
+            cp0 = s.stats_checkpoint()
+            stop = threading.Event()
+            checkpoints: list = []
+
+            def make_checkpoints() -> None:
+                while not stop.is_set():
+                    checkpoints.append(s.stats_checkpoint())
+                    time.sleep(0.0001)
+
+            cp_threads = [
+                threading.Thread(target=make_checkpoints) for _ in range(3)
+            ]
+            for t in cp_threads:
+                t.start()
+
+            def submit_batch(seed: int) -> None:
+                for i in range(per_thread):
+                    idx = seed * per_thread + i
+
+                    def fn(idx: int = idx) -> int:
+                        if idx % 37 == 0:
+                            raise RuntimeError("boom-%d" % idx)
+                        return idx
+
+                    # 失败任务由 submit 原样抛回调用方：吞掉预期的任务异常，
+                    # 任务本身仍计入 accepted/failed，提交线程继续跑完批次。
+                    try:
+                        s.submit("t%d" % idx, fn)
+                    except RuntimeError as exc:
+                        self.assertTrue(str(exc).startswith("boom-"))
+
+            submit_threads = [
+                threading.Thread(target=submit_batch, args=(k,))
+                for k in range(submitters)
+            ]
+            for t in submit_threads:
+                t.start()
+            for t in submit_threads:
+                t.join()
+            # submit 阻塞到任务结束：此刻全部任务已落终态。先停掉边界线程
+            # 并汇合，再创建最后一个边界，保证 ordered 严格按创建时刻递增。
+            stop.set()
+            for t in cp_threads:
+                t.join()
+            cp_last = s.stats_checkpoint()
+
+            total_tasks = submitters * per_thread
+            total = s.snapshot()
+            self.assertEqual(total.accepted, total_tasks)
+            self.assertEqual(
+                total.completed + total.failed, total_tasks
+            )
+
+            # 所有结束样本数与 completed+failed 一致。
+            self.assertEqual(
+                len(_samples(total, "total")), total_tasks
+            )
+
+            # 区间代数：记 c0 < c1 < ... < ck，任务全部结束后
+            # snapshot_since(c_i) = 总量 - 边界 i 基值；相邻两次查询之差
+            # 即区间 (c_i, c_{i+1}] 的事件数。并发创建下每个区间的计数必
+            # 非负，且各区间 + 尾区间不重不漏地覆盖 c0 之后全部事件。
+            # 追加 list 的线程调度顺序未必等于边界创建顺序，按边界 id 排序。
+            ordered = sorted(
+                [cp0] + checkpoints + [cp_last],
+                key=lambda cp: cp._checkpoint_id,
+            )
+            seen_since_cp0 = s.snapshot_since(cp0)
+
+            def counts(snap: object) -> tuple:
+                return (
+                    snap.accepted, snap.completed, snap.failed,
+                    snap.cancelled, snap.expired, snap.rejected,
+                )
+
+            # 去重并发产生的“同值不同对象”边界无需特殊处理：相邻边界基值
+            # 相同的空区间各项差值为 0，仍满足非负与求和恒等式。
+            deltas = [0, 0, 0, 0, 0, 0]
+            wait_delta_total = 0
+            total_delta_total = 0
+            prev_counts = counts(seen_since_cp0)
+            prev_wait = len(_samples(seen_since_cp0, "wait"))
+            prev_total = len(_samples(seen_since_cp0, "total"))
+            for cp in ordered[1:]:
+                cur = s.snapshot_since(cp)
+                cur_counts = counts(cur)
+                for j, (a, b) in enumerate(zip(prev_counts, cur_counts)):
+                    delta = a - b
+                    self.assertGreaterEqual(delta, 0)
+                    deltas[j] += delta
+                # 每跨过一个边界，尾部样本只可能变短，缩短量即区间样本数；
+                # 两类样本同样满足相邻区间不重不漏。
+                cur_wait = len(_samples(cur, "wait"))
+                cur_total = len(_samples(cur, "total"))
+                self.assertLessEqual(cur_wait, prev_wait)
+                self.assertLessEqual(cur_total, prev_total)
+                wait_delta_total += prev_wait - cur_wait
+                total_delta_total += prev_total - cur_total
+                prev_counts = cur_counts
+                prev_wait = cur_wait
+                prev_total = cur_total
+
+            # 尾区间 = 最后一个边界之后（任务此刻已全部结束，应为 0）。
+            tail = s.snapshot_since(cp_last)
+            self.assertEqual(counts(tail), (0, 0, 0, 0, 0, 0))
+
+            # 各区间之和恰好等于 c0 之后的全部事件，不重不漏。
+            self.assertEqual(tuple(deltas), counts(seen_since_cp0))
+            # 两类延迟样本各区间之和也恰好覆盖 c0 之后的全部结束样本。
+            self.assertEqual(
+                wait_delta_total, len(_samples(seen_since_cp0, "wait"))
+            )
+            self.assertEqual(
+                total_delta_total, len(_samples(seen_since_cp0, "total"))
+            )
+            # 区间结束样本数之和等于区间 completed+failed。
+            self.assertEqual(
+                deltas[1] + deltas[2],
+                seen_since_cp0.completed + seen_since_cp0.failed,
+            )
+
+
 class SubmitNowaitTest(unittest.TestCase):
     def test_returns_handle_immediately(self) -> None:
         release = threading.Event()

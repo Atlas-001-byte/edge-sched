@@ -9,6 +9,10 @@
 - :func:`~edge_sched.scheduler.Scheduler.submit_with_wait` -- 容量满时按
   发起先后排队等待名额（可带 admission_timeout_ms），再等待结果。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
+- :func:`~edge_sched.scheduler.Scheduler.stats_checkpoint` -- 创建区间统计
+  观测边界 :class:`~edge_sched.stats.StatsCheckpoint`。
+- :func:`~edge_sched.scheduler.Scheduler.snapshot_since` -- 返回边界之后事件
+  的区间统计快照（形态同累计快照）。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
   :class:`~edge_sched.errors.InputValidationError` /
@@ -26,12 +30,13 @@ from .errors import (
     TaskCancelledError,
 )
 from .scheduler import Scheduler, TaskHandle
-from .stats import StatsSnapshot, percentile
+from .stats import StatsCheckpoint, StatsSnapshot, percentile
 
 __all__ = [
     "Scheduler",
     "TaskHandle",
     "StatsSnapshot",
+    "StatsCheckpoint",
     "percentile",
     "EdgeSchedError",
     "BackpressureError",
