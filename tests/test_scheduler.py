@@ -732,6 +732,267 @@ class CancelTest(unittest.TestCase):
         self.assertEqual(len(_samples(snap, "total")), finished)
 
 
+class PriorityValidationTest(unittest.TestCase):
+    def test_bad_priority_argument(self) -> None:
+        with Scheduler(1, 4, priority=True) as s:
+            for bad in (1.5, "2", True, False, None, [1], 0.0):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(InputValidationError):
+                        s.submit("t", lambda: None, priority=bad)  # type: ignore[arg-type]
+                    with self.assertRaises(InputValidationError):
+                        s.submit_nowait("u", lambda: None, priority=bad)  # type: ignore[arg-type]
+            # 校验失败不改变统计，也不占用 task_id。
+            snap = s.snapshot()
+            self.assertEqual(
+                (snap.accepted, snap.completed, snap.rejected), (0, 0, 0)
+            )
+            self.assertEqual(s.submit("ok", lambda: 1, priority=3), 1)
+
+    def test_bad_priority_switch(self) -> None:
+        for bad in (0, 1, "true", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InputValidationError):
+                    Scheduler(workers=1, max_pending=2, priority=bad)  # type: ignore[arg-type]
+
+    def test_timeout_still_third_positional(self) -> None:
+        with Scheduler(1, 2, priority=True) as s:
+            with self.assertRaises(TimeoutError):
+                s.submit("slow", lambda: time.sleep(0.2), 0.03, priority=9)
+
+
+class PrioritySchedulingTest(unittest.TestCase):
+    @staticmethod
+    def _rec(order: list, lock: threading.Lock, tid: str) -> "any":
+        def fn() -> str:
+            with lock:
+                order.append(tid)
+            return tid
+        return fn
+
+    def test_higher_priority_dispatched_first_with_fifo_tiebreak(self) -> None:
+        order: list[str] = []
+        lock = threading.Lock()
+        worker_free = threading.Event()
+
+        with Scheduler(workers=1, max_pending=16, priority=True) as s:
+            holder = threading.Thread(
+                target=s.submit, args=("_", lambda: worker_free.wait(2.0))
+            )
+            holder.start()
+            self.assertTrue(_wait_started(s, "_"))
+
+            handles = []
+            for tid, pr in (
+                ("a", 0), ("b", 5), ("c", 5), ("d", -2), ("e", 10),
+            ):
+                handles.append(
+                    s.submit_nowait(tid, self._rec(order, lock, tid), priority=pr)
+                )
+            # 确保全部已进入待派发堆后再放行唯一工作线程。
+            self.assertTrue(_wait_pending(s, 6))
+            worker_free.set()
+            holder.join()
+            for h in handles:
+                h.result()
+
+        # priority 降序：e(10) -> b,c(5，同值按接受先后) -> a(0) -> d(-2)。
+        self.assertEqual(order, ["e", "b", "c", "a", "d"])
+
+    def test_default_mode_ignores_priority(self) -> None:
+        order: list[str] = []
+        lock = threading.Lock()
+        worker_free = threading.Event()
+
+        with Scheduler(workers=1, max_pending=8) as s:
+            holder = threading.Thread(
+                target=s.submit, args=("_", lambda: worker_free.wait(2.0))
+            )
+            holder.start()
+            self.assertTrue(_wait_started(s, "_"))
+            # FCFS 模式即使携带较大 priority 也严格按接受顺序派发。
+            hs = [
+                s.submit_nowait("a", self._rec(order, lock, "a"), priority=10),
+                s.submit_nowait("b", self._rec(order, lock, "b"), priority=0),
+                s.submit_nowait("c", self._rec(order, lock, "c"), priority=99),
+            ]
+            self.assertTrue(_wait_pending(s, 4))
+            worker_free.set()
+            holder.join()
+            for h in hs:
+                h.result()
+        self.assertEqual(order, ["a", "b", "c"])
+
+    def test_priority_does_not_reorder_running_tasks(self) -> None:
+        entered = [threading.Event(), threading.Event()]
+        release = threading.Event()
+        high_started = threading.Event()
+
+        def low(i: int) -> "any":
+            def fn() -> None:
+                entered[i].set()
+                release.wait(2.0)
+            return fn
+
+        with Scheduler(workers=2, max_pending=8, priority=True) as s:
+            s.submit_nowait("l0", low(0), priority=0)
+            s.submit_nowait("l1", low(1), priority=0)
+            self.assertTrue(entered[0].wait(2.0))
+            self.assertTrue(entered[1].wait(2.0))
+            # 两个线程均已在执行低优先级任务；高优先级任务只能排队等待，
+            # 不会重排/抢占执行中的任务。
+            high = s.submit_nowait(
+                "hi",
+                lambda: high_started.set() or None,
+                priority=100,
+            )
+            self.assertFalse(high_started.wait(0.15))
+            release.set()
+            self.assertTrue(high_started.wait(2.0))
+            self.assertIsNone(high.result())
+
+    def test_multi_worker_fills_slots_by_priority(self) -> None:
+        order: list[str] = []
+        lock = threading.Lock()
+        release = threading.Event()
+
+        with Scheduler(workers=2, max_pending=16, priority=True) as s:
+            h0 = s.submit_nowait("x0", lambda: release.wait(2.0))
+            h1 = s.submit_nowait("x1", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "x0"))
+            self.assertTrue(_wait_started(s, "x1"))
+
+            queued = []
+            for tid, pr in (("a", 1), ("b", 5), ("c", 5), ("d", 10)):
+                queued.append(
+                    s.submit_nowait(tid, self._rec(order, lock, tid), priority=pr)
+                )
+            self.assertTrue(_wait_pending(s, 6))
+            release.set()
+            h0.result(); h1.result()
+            for h in queued:
+                h.result()
+
+        # 两个工作线程空出后：d(10) 先、b/c(5) 同值按序、最后 a(1)。
+        self.assertEqual(order, ["d", "b", "c", "a"])
+
+    def test_cancelled_heap_entry_is_skipped(self) -> None:
+        order: list[str] = []
+        lock = threading.Lock()
+        worker_free = threading.Event()
+
+        with Scheduler(workers=1, max_pending=8, priority=True) as s:
+            holder = threading.Thread(
+                target=s.submit, args=("_", lambda: worker_free.wait(2.0))
+            )
+            holder.start()
+            self.assertTrue(_wait_started(s, "_"))
+            ha = s.submit_nowait("a", self._rec(order, lock, "a"), priority=1)
+            hb = s.submit_nowait("b", self._rec(order, lock, "b"), priority=10)
+            hc = s.submit_nowait("c", self._rec(order, lock, "c"), priority=5)
+            self.assertTrue(_wait_pending(s, 4))
+            # 取消堆顶 b：惰性跳过后顺序为 c(5) -> a(1)。
+            self.assertTrue(hb.cancel())
+            worker_free.set()
+            holder.join()
+            ha.result(); hc.result()
+            with self.assertRaises(TaskCancelledError):
+                hb.result()
+
+        self.assertEqual(order, ["c", "a"])
+        snap = s.snapshot()
+        self.assertEqual((snap.accepted, snap.completed, snap.cancelled),
+                         (4, 3, 1))
+
+    def test_cancel_in_priority_mode_frees_capacity(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2, priority=True) as s:
+            s.submit_nowait("a", lambda: release.wait(2.0), priority=0)
+            self.assertTrue(_wait_started(s, "a"))
+            queued = s.submit_nowait("b", lambda: "b", priority=1)
+            self.assertTrue(_wait_pending(s, 2))
+            with self.assertRaises(BackpressureError):
+                s.submit_nowait("c", lambda: None, priority=2)
+            self.assertTrue(queued.cancel())
+            hc = s.submit_nowait("c", lambda: "c", priority=2)
+            release.set()
+            self.assertEqual(hc.result(), "c")
+        snap = s.snapshot()
+        self.assertEqual((snap.accepted, snap.cancelled, snap.completed),
+                         (3, 1, 2))
+
+    def test_task_id_reusable_after_cancel_priority_mode(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=4, priority=True) as s:
+            s.submit_nowait("a", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "a"))
+            old = s.submit_nowait("r", lambda: "old", priority=1)
+            self.assertTrue(old.cancel())
+            new = s.submit_nowait("r", lambda: "new", priority=2)
+            release.set()
+            self.assertEqual(new.result(), "new")
+            with self.assertRaises(TaskCancelledError):
+                old.result()
+            self.assertEqual(s.result("r"), "new")
+
+    def test_cancel_vs_start_race_priority_mode(self) -> None:
+        # 优先级派发路径下同样保证：每个任务恰好“执行完成”或“被取消”，
+        # 不重排执行中任务，终态计数各一次。
+        n = 200
+        s = Scheduler(workers=4, max_pending=n + 1, priority=True)
+        ran: set[str] = set()
+        ran_lock = threading.Lock()
+        handles: list[TaskHandle] = []
+
+        def make(tid: str) -> "any":
+            def fn() -> str:
+                time.sleep(0.001)
+                with ran_lock:
+                    ran.add(tid)
+                return tid
+            return fn
+
+        # 交错优先级提交，使堆顺序与接受顺序不同。
+        for i in range(n):
+            handles.append(
+                s.submit_nowait("t%d" % i, make("t%d" % i),
+                                priority=(i * 13) % 17 - 8)
+            )
+        cancelers = [
+            threading.Thread(target=lambda h=h: h.cancel()) for h in handles
+        ]
+        for t in cancelers:
+            t.start()
+        for t in cancelers:
+            t.join()
+        s.close()
+
+        outcomes: dict[str, str] = {}
+        for h in handles:
+            tid = h._entry.task_id  # type: ignore[attr-defined]
+            try:
+                h.result()
+                outcomes[tid] = "ran"
+            except TaskCancelledError:
+                outcomes[tid] = "cancelled"
+
+        self.assertEqual(len(outcomes), n)
+        for tid, outcome in outcomes.items():
+            if outcome == "ran":
+                self.assertIn(tid, ran)
+            else:
+                self.assertNotIn(tid, ran)
+        self.assertEqual(len(ran),
+                         sum(o == "ran" for o in outcomes.values()))
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, n)
+        self.assertEqual(
+            snap.completed + snap.failed + snap.cancelled, n
+        )
+        finished = snap.completed + snap.failed
+        self.assertEqual(len(_samples(snap, "wait")), finished)
+        self.assertEqual(len(_samples(snap, "total")), finished)
+
+
 def _wait_started(s: Scheduler, task_id: str) -> bool:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:

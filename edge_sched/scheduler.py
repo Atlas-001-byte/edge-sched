@@ -2,9 +2,12 @@
 
 结构:
 
-- submit / submit_nowait 在调用方线程通过校验后，任务进入有界的入站队列
-  （先到先服务）；submit 阻塞等待结果，submit_nowait 立即返回 TaskHandle。
-- 一个事件循环线程按入队顺序取出任务，在有空闲工作线程时派发到就绪队列。
+- submit / submit_nowait 在调用方线程通过校验后，任务进入有界的入站队列；
+  submit 阻塞等待结果，submit_nowait 立即返回 TaskHandle。
+- 一个事件循环线程在有空闲工作线程时把任务派发到就绪队列：默认严格按
+  接受顺序先到先服务（FCFS）；priority=True 时按 priority 数值降序派发，
+  同值仍按接受顺序。优先级只改变已接受但未开始执行任务的派发顺序，
+  执行中、已结束任务不重排，每个任务只执行一次。
 - 工作线程执行无参数 callable，记录排队/总延迟，唤醒等待方。
 - 未完成（已接受但未结束）任务数达到 ``max_pending`` 时触发背压拒绝。
 - 已接受但尚未开始执行的任务可通过 submit_nowait 返回的 TaskHandle.cancel
@@ -15,6 +18,7 @@
 
 from __future__ import annotations
 
+import heapq
 import queue
 import threading
 import time
@@ -52,6 +56,8 @@ class _TaskEntry:
     __slots__ = (
         "task_id",
         "fn",
+        "priority",
+        "seq",
         "submit_time",
         "done",
         "success",
@@ -62,9 +68,12 @@ class _TaskEntry:
     )
 
     def __init__(self, task_id: str, fn: Callable[[], Any],
-                 submit_time: float) -> None:
+                 submit_time: float, priority: int, seq: int) -> None:
         self.task_id = task_id
         self.fn = fn
+        self.priority = priority
+        # 接受序号：priority 相同时按接受先后派发（FCFS）。
+        self.seq = seq
         self.submit_time = submit_time
         self.done = threading.Event()
         self.success = False
@@ -133,9 +142,13 @@ class Scheduler:
 
     :param workers: 工作线程数，必须为 >= 1 的整数。
     :param max_pending: 未完成任务（含排队中与执行中）上限，必须为 >= 1 的整数。
+    :param priority: False（默认）时严格按接受顺序 FCFS 派发；True 时启用
+        可选优先级调度，已接受但未开始执行的任务按 priority 数值降序派发，
+        同值按接受顺序派发。优先级不影响执行中、已完成、已取消或已拒绝任务。
     """
 
-    def __init__(self, workers: int, max_pending: int) -> None:
+    def __init__(self, workers: int, max_pending: int,
+                 priority: bool = False) -> None:
         if not self._is_positive_int(workers):
             raise InputValidationError(
                 "workers must be an integer >= 1, got %r" % (workers,)
@@ -144,10 +157,17 @@ class Scheduler:
             raise InputValidationError(
                 "max_pending must be an integer >= 1, got %r" % (max_pending,)
             )
+        if not isinstance(priority, bool):
+            raise InputValidationError(
+                "priority must be a bool (scheduling switch), got %r"
+                % (priority,)
+            )
         self._workers = workers
         self._max_pending = max_pending
+        self._priority = priority
 
-        # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished 的读写。
+        # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished/
+        # _seq 的读写。
         self._cond = threading.Condition()
         self._closing = False
         self._closed = False
@@ -155,6 +175,8 @@ class Scheduler:
         self._unfinished: set[str] = set()
         # 全部已接受任务的条目长期保留，关闭后结果仍可读取。
         self._tasks: dict[str, _TaskEntry] = {}
+        # 单调递增的接受序号，用于 FCFS 与同优先级的先后裁决。
+        self._seq = 0
 
         self._stats = Stats()
         self._inbound: "queue.Queue[Any]" = queue.Queue()
@@ -162,6 +184,17 @@ class Scheduler:
         # 空闲工作线程许可：事件循环派发前必须先取得一个许可。
         self._worker_slots = threading.BoundedSemaphore(workers)
         self._stop_dispatcher = threading.Event()
+
+        # 优先级模式下由专用条件变量（自带锁）保护的待派发堆；FCFS 不使用。
+        # 堆项为 (-priority, seq, entry)：priority 越大越先派发，
+        # 同 priority 按接受序号 seq 升序。
+        self._heap_cond = threading.Condition()
+        self._heap: list[tuple[int, int, "_TaskEntry"]] = []
+        # 已派发到就绪队列或正在工作线程执行的任务数（仅优先级模式使用），
+        # 与信号量许可一一对应，用于在许可释放时即时唤醒派发循环。
+        self._busy = 0
+        # 优先级派发循环的退出标志（close 在排空全部任务后置位）。
+        self._heap_closed = False
 
         self._dispatcher = threading.Thread(
             target=self._run_dispatcher, name="edge-sched-loop", daemon=True
@@ -186,7 +219,8 @@ class Scheduler:
     # ------------------------------------------------------------------ public
 
     def submit(self, task_id: str, fn: Callable[[], T],
-               timeout: Optional[float] = None) -> T:
+               timeout: Optional[float] = None,
+               priority: int = 0) -> T:
         """提交任务并阻塞等待结果。
 
         结果语义（每个任务只可能有一种）:
@@ -196,19 +230,23 @@ class Scheduler:
         - 未完成任务数已达上限：抛 :class:`BackpressureError`，无结果无统计。
         - task_id 与未完成任务重复：抛 :class:`DuplicateTaskError`。
         - 调度器已关闭：抛 :class:`SchedulerClosedError`。
-        - 参数非法：抛 :class:`InputValidationError`。
+        - 参数非法（含 priority 非整数或为布尔值）：抛
+          :class:`InputValidationError`。
         - 等待超过 ``timeout`` 秒：抛 :class:`TimeoutError`，任务仍继续执行，
           其最终结果不受影响。
 
         :param task_id: 非空字符串，任务唯一标识。
         :param fn: 无参数 callable。
-        :param timeout: 可选等待超时（秒），None 表示一直等待。
+        :param timeout: 可选等待超时（秒），位置与语义不变，None 表示一直等待。
+        :param priority: 可选整数，缺省 0；数值较大的任务优先派发，
+            同值按接受先后派发。仅在构造调度器时 ``priority=True`` 生效，
+            且只影响已接受但未开始执行任务进入工作线程的顺序。
         """
         if timeout is not None and timeout < 0:
             raise InputValidationError(
                 "timeout must be >= 0 or None, got %r" % (timeout,)
             )
-        entry = self._admit(task_id, fn)
+        entry = self._admit(task_id, fn, priority)
 
         if not entry.done.wait(timeout):
             raise TimeoutError(
@@ -219,18 +257,20 @@ class Scheduler:
         assert entry.exception is not None
         raise entry.exception
 
-    def submit_nowait(self, task_id: str, fn: Callable[[], T]) -> TaskHandle:
+    def submit_nowait(self, task_id: str, fn: Callable[[], T],
+                      priority: int = 0) -> TaskHandle:
         """提交任务并立即返回句柄，不等待 callable 执行结束。
 
         准入校验与 :meth:`submit` 完全一致（参数校验、关闭、重复 task_id、
-        背压），通过后任务进入同一事件循环由工作线程按顺序派发；
+        背压、priority 校验），通过后任务进入同一事件循环由工作线程派发；
         返回前 accepted 计数已更新。任务进度与结果通过返回的
         :class:`TaskHandle` 查询。
 
         :param task_id: 非空字符串，任务唯一标识。
         :param fn: 无参数 callable。
+        :param priority: 可选整数，缺省 0，语义同 :meth:`submit`。
         """
-        entry = self._admit(task_id, fn)
+        entry = self._admit(task_id, fn, priority)
         return TaskHandle(self, entry)
 
     def result(self, task_id: str) -> Any:
@@ -285,10 +325,18 @@ class Scheduler:
             while self._pending > 0:
                 self._cond.wait()
 
-        # pending 归零意味着没有未结束任务：入站队列中至多残留已取消任务
-        # 的惰性令牌（派发前会按 done 跳过），停止事件循环是安全的。
-        self._stop_dispatcher.set()
-        self._dispatcher.join()
+        if self._priority:
+            # pending 归零意味着堆中不再有未结束任务（至多残留已取消任务的
+            # 惰性堆项，弹出时按 done 跳过）；通知派发循环退出。
+            with self._heap_cond:
+                self._heap_closed = True
+                self._heap_cond.notify_all()
+            self._dispatcher.join()
+        else:
+            # pending 归零意味着没有未结束任务：入站队列中至多残留已取消任务
+            # 的惰性令牌（派发前会按 done 跳过），停止事件循环是安全的。
+            self._stop_dispatcher.set()
+            self._dispatcher.join()
 
         # 每个工作线程一个停止哨兵。
         for _ in range(self._workers):
@@ -302,8 +350,9 @@ class Scheduler:
 
     # ------------------------------------------------------------- internals
 
-    def _admit(self, task_id: str, fn: Callable[[], Any]) -> "_TaskEntry":
-        """校验参数并完成准入：登记任务、更新计数、放入入站队列。
+    def _admit(self, task_id: str, fn: Callable[[], Any],
+               priority: int = 0) -> "_TaskEntry":
+        """校验参数并完成准入：登记任务、更新计数、放入待派发队列。
 
         submit 与 submit_nowait 共用；任何失败路径都不产生任务条目，
         除背压拒绝计入 rejected 外不改变统计。
@@ -314,6 +363,11 @@ class Scheduler:
             )
         if not callable(fn):
             raise InputValidationError("fn must be callable, got %r" % (fn,))
+        # bool 是 int 的子类，但 priority 不接受布尔值。
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise InputValidationError(
+                "priority must be an integer, got %r" % (priority,)
+            )
 
         with self._cond:
             if self._closing:
@@ -328,16 +382,27 @@ class Scheduler:
                     "pending task limit %d reached" % self._max_pending
                 )
 
-            entry = _TaskEntry(task_id, fn, time.monotonic())
+            seq = self._seq
+            self._seq += 1
+            entry = _TaskEntry(
+                task_id, fn, time.monotonic(), priority, seq
+            )
             self._tasks[task_id] = entry
             self._unfinished.add(task_id)
             self._pending += 1
             self._stats.record_accepted()
 
-        # 入队在锁外：Queue 本身线程安全，入队顺序即接受顺序（FCFS）。
-        # 队列携带条目本身而非 task_id：任务取消后 task_id 立即可被同名
-        # 新任务复用，旧令牌绝不能因此误取到新任务的条目。
-        self._inbound.put(entry)
+        # 入队在 _cond 锁外。队列携带条目本身而非 task_id：任务取消后
+        # task_id 立即可被同名新任务复用，旧令牌绝不能因此误取到新条目。
+        if self._priority:
+            # 堆项 (-priority, seq, entry)：priority 降序、接受顺序升序。
+            item = (-priority, seq, entry)
+            with self._heap_cond:
+                heapq.heappush(self._heap, item)
+                self._heap_cond.notify()
+        else:
+            # FCFS：Queue 本身线程安全，入队顺序即接受顺序。
+            self._inbound.put(entry)
         return entry
 
     def _cancel(self, entry: "_TaskEntry") -> bool:
@@ -364,7 +429,14 @@ class Scheduler:
         return True
 
     def _run_dispatcher(self) -> None:
-        """事件循环：按 FCFS 顺序把任务派发给空闲工作线程。"""
+        """事件循环入口：按调度模式选择派发策略。"""
+        if self._priority:
+            self._run_priority_dispatcher()
+        else:
+            self._run_fcfs_dispatcher()
+
+    def _run_fcfs_dispatcher(self) -> None:
+        """FCFS：按接受顺序把任务派发给空闲工作线程。"""
         while not self._stop_dispatcher.is_set():
             try:
                 entry = self._inbound.get(timeout=_DISPATCH_POLL)
@@ -378,6 +450,33 @@ class Scheduler:
             # workers 个待执行任务，且任务不会在就绪队列里无限堆积。
             self._worker_slots.acquire()
             self._ready.put(entry)
+
+    def _run_priority_dispatcher(self) -> None:
+        """优先级派发：priority 降序、同值按接受顺序派发给空闲工作线程。
+
+        待派发任务保存在堆中；仅在有空闲工作线程（busy < workers）时弹出
+        堆顶。堆顶若是等待期间已取消的任务则惰性跳过；所有剩余任务都在
+        等待空闲线程时，在条件变量上睡眠，由工作线程结束任务时唤醒，
+        无需轮询。
+        """
+        with self._heap_cond:
+            while True:
+                while True:
+                    if self._heap_closed and not self._heap:
+                        return
+                    if self._heap and self._busy < self._workers:
+                        _, _, entry = heapq.heappop(self._heap)
+                        # 已在堆中等待期间被取消的任务：终态已由 _cancel
+                        # 落定，跳过且不占用工作线程许可。
+                        if entry.done.is_set():
+                            continue
+                        self._busy += 1
+                        self._worker_slots.acquire()
+                        self._ready.put(entry)
+                        # 继续尝试填满其余空闲线程（一次唤醒可派发多个）。
+                    else:
+                        break
+                self._heap_cond.wait(timeout=_DISPATCH_POLL)
 
     def _run_worker(self) -> None:
         """工作线程：认领 -> 执行 callable -> 记录统计 -> 唤醒等待方。"""
@@ -393,6 +492,10 @@ class Scheduler:
             with self._cond:
                 if entry.cancelled:
                     self._worker_slots.release()
+                    if self._priority:
+                        with self._heap_cond:
+                            self._busy -= 1
+                            self._heap_cond.notify()
                     continue
                 entry.started = True
 
@@ -425,6 +528,11 @@ class Scheduler:
 
             # 执行结束才释放许可，许可数即并发执行数。
             self._worker_slots.release()
+            if self._priority:
+                # 归还一个执行名额并即时唤醒派发循环派发下一个堆顶任务。
+                with self._heap_cond:
+                    self._busy -= 1
+                    self._heap_cond.notify()
 
     # ------------------------------------------------------------- context mgr
 

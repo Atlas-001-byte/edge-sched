@@ -87,6 +87,12 @@ class CliValidationTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("InputValidationError", err.getvalue())
 
+    def test_bad_priority(self) -> None:
+        for bad in (1.5, True, False, "2", None, [1], {"x": 1}):
+            self._expect_exit_2(
+                [{"task_id": "a", "sleep_ms": 0, "priority": bad}]
+            )
+
     def test_element_not_object(self) -> None:
         self._expect_exit_2([1, 2])
 
@@ -98,7 +104,7 @@ class CliSuccessTest(unittest.TestCase):
         self.dir = self._tmp.name
 
     def _execute(self, tasks: object, workers: int = 4,
-                 max_pending: int = 8) -> dict:
+                 max_pending: int = 8, priority_flag: bool = False) -> dict:
         import io
         from contextlib import redirect_stdout
 
@@ -106,10 +112,14 @@ class CliSuccessTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(tasks, f)
 
+        argv = ["--input", path, "--workers", str(workers),
+                "--max-pending", str(max_pending)]
+        if priority_flag:
+            argv.append("--priority")
+
         out = io.StringIO()
         with redirect_stdout(out):
-            code = run(["--input", path, "--workers", str(workers),
-                        "--max-pending", str(max_pending)])
+            code = run(argv)
         self.assertEqual(code, 0)
         return json.loads(out.getvalue())
 
@@ -151,6 +161,50 @@ class CliSuccessTest(unittest.TestCase):
         )
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
+
+    def test_priority_field_defaults_and_flag(self) -> None:
+        tasks = [
+            {"task_id": "t0", "sleep_ms": 0},
+            {"task_id": "t1", "sleep_ms": 0, "priority": 5},
+            {"task_id": "t2", "sleep_ms": 0, "priority": -3},
+            {"task_id": "t3", "sleep_ms": 0, "priority": 0},
+        ]
+        # 无论是否启用 --priority，结果数组都按输入顺序返回，输出形状不变。
+        for flag in (False, True):
+            report = self._execute(tasks, workers=1, max_pending=8,
+                                   priority_flag=flag)
+            self.assertEqual([r["task_id"] for r in report["results"]],
+                             ["t0", "t1", "t2", "t3"])
+            for r in report["results"]:
+                self.assertIsNone(r["result"])
+            stats = report["stats"]
+            self.assertEqual((stats["accepted"], stats["completed"]), (4, 4))
+
+    def test_priority_flag_runs_mixed_priorities(self) -> None:
+        # --priority 下混合显式/缺省 priority 的任务全部正常执行；
+        # 具体派发顺序由 Scheduler 层测试覆盖，CLI 只保证结果按输入顺序、
+        # 统计口径不变。
+        tasks = [
+            {"task_id": "p%d" % i, "sleep_ms": 0,
+             "priority": (i * 7) % 5 - 2}
+            for i in range(12)
+        ]
+        report = self._execute(tasks, workers=3, max_pending=6,
+                               priority_flag=True)
+        self.assertEqual(
+            [r["task_id"] for r in report["results"]],
+            [t["task_id"] for t in tasks],
+        )
+        stats = report["stats"]
+        self.assertEqual((stats["accepted"], stats["completed"]), (12, 12))
+        self.assertEqual(
+            (stats["failed"], stats["cancelled"], stats["rejected"]),
+            (0, 0, 0),
+        )
+        for group in ("queue_wait_ms", "total_latency_ms"):
+            self.assertEqual(
+                set(stats[group]), {"p50", "p95", "p99", "max"}
+            )
 
 
 class CliModuleTest(unittest.TestCase):
