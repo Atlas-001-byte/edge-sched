@@ -32,8 +32,8 @@ class StatsTest(unittest.TestCase):
         snap = Stats().snapshot()
         self.assertEqual(
             (snap.accepted, snap.completed, snap.failed,
-             snap.cancelled, snap.rejected),
-            (0, 0, 0, 0, 0),
+             snap.cancelled, snap.expired, snap.rejected),
+            (0, 0, 0, 0, 0, 0),
         )
         self.assertEqual(
             snap.queue_wait_ms,
@@ -74,6 +74,19 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(snap.queue_wait_ms["max"], 0.0)
         self.assertEqual(snap.total_latency_ms["max"], 0.0)
 
+    def test_expired_count_no_samples(self) -> None:
+        stats = Stats()
+        stats.record_accepted()
+        stats.record_expired()
+        snap = stats.snapshot()
+        self.assertEqual(snap.expired, 1)
+        self.assertEqual(snap.completed, 0)
+        self.assertEqual(snap.failed, 0)
+        self.assertEqual(snap.cancelled, 0)
+        # 到期任务不贡献任何延迟样本。
+        self.assertEqual(snap.queue_wait_ms["max"], 0.0)
+        self.assertEqual(snap.total_latency_ms["max"], 0.0)
+
     def test_snapshot_is_fixed(self) -> None:
         stats = Stats()
         stats.record_accepted()
@@ -94,8 +107,8 @@ class StatsTest(unittest.TestCase):
         stats.record_finished(0.1236, 0.9994, success=True)
         d = stats.snapshot().to_dict()
         self.assertEqual(set(d), {
-            "accepted", "completed", "failed", "cancelled", "rejected",
-            "queue_wait_ms", "total_latency_ms",
+            "accepted", "completed", "failed", "cancelled", "expired",
+            "rejected", "queue_wait_ms", "total_latency_ms",
         })
         # 毫秒保留三位小数。
         self.assertEqual(d["total_latency_ms"]["max"], 0.999)

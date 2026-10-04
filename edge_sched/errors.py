@@ -31,6 +31,14 @@ class TaskCancelledError(EdgeSchedError):
     """
 
 
+class QueueTimeoutError(EdgeSchedError):
+    """已接受任务在工作线程认领前超过 ``max_queue_wait_ms`` 排队时限。
+
+    callable 完全不会执行；任务计入 accepted 与 expired，
+    但不计入 completed/failed/cancelled，也不贡献延迟样本。
+    """
+
+
 class SchedulerClosedError(EdgeSchedError):
     """调度器已关闭，不再接受新任务。"""
 

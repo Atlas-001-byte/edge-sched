@@ -93,6 +93,13 @@ class CliValidationTest(unittest.TestCase):
                 [{"task_id": "a", "sleep_ms": 0, "priority": bad}]
             )
 
+    def test_bad_max_queue_wait_ms(self) -> None:
+        # bool、0、负数、浮点数、字符串都在读取输入时报 InputValidationError。
+        for bad in (True, False, 0, -5, 1.5, "10", [1]):
+            self._expect_exit_2(
+                [{"task_id": "a", "sleep_ms": 0, "max_queue_wait_ms": bad}]
+            )
+
     def test_element_not_object(self) -> None:
         self._expect_exit_2([1, 2])
 
@@ -130,6 +137,7 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["accepted"], 5)
         self.assertEqual(stats["completed"], 5)
         self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["expired"], 0)
         self.assertEqual(stats["rejected"], 0)
         for group in ("queue_wait_ms", "total_latency_ms"):
             self.assertEqual(
@@ -152,8 +160,8 @@ class CliSuccessTest(unittest.TestCase):
         stats = report["stats"]
         self.assertEqual(
             (stats["accepted"], stats["completed"],
-             stats["failed"], stats["rejected"]),
-            (0, 0, 0, 0),
+             stats["failed"], stats["expired"], stats["rejected"]),
+            (0, 0, 0, 0, 0),
         )
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
@@ -174,6 +182,32 @@ class CliSuccessTest(unittest.TestCase):
         for r in report["results"]:
             self.assertEqual(set(r), {"task_id", "result"})
         self.assertEqual(report["stats"]["completed"], 3)
+
+    def test_expired_task_result_object_and_stats(self) -> None:
+        # 单工作线程被首个长任务占住：带排队时限的第二个任务到期，
+        # 结果对象只含 task_id 与 error，且保留输入位置。
+        tasks = [
+            {"task_id": "slow", "sleep_ms": 400},
+            {"task_id": "imp", "sleep_ms": 0, "max_queue_wait_ms": 20},
+            {"task_id": "ok", "sleep_ms": 0},
+        ]
+        report = self._execute(tasks, workers=1, max_pending=3)
+        self.assertEqual(
+            [r["task_id"] for r in report["results"]],
+            ["slow", "imp", "ok"],
+        )
+        self.assertEqual(set(report["results"][0]), {"task_id", "result"})
+        self.assertEqual(
+            report["results"][1],
+            {"task_id": "imp", "error": "QueueTimeoutError"},
+        )
+        self.assertEqual(set(report["results"][2]), {"task_id", "result"})
+        stats = report["stats"]
+        self.assertEqual(stats["accepted"], 3)
+        self.assertEqual(stats["expired"], 1)
+        self.assertEqual(stats["completed"], 2)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["cancelled"], 0)
 
 
 class CliModuleTest(unittest.TestCase):
