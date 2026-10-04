@@ -5,15 +5,19 @@
     python -m edge_sched --input tasks.json --workers N --max-pending M
 
 输入文件为 JSON 数组，每个元素形如
-``{"task_id": "a", "sleep_ms": 10, "priority": 1}``，其中 ``sleep_ms`` 为
-非负整数，``priority`` 为可选整数（缺省 0，不接受布尔值）；priority 数值
-较大的任务先派发给工作线程，相同数值按文件中的接受先后派发。每个任务
-执行一次对应的空等待（``time.sleep``），完成后向标准输出打印任务结果
-（仍按输入顺序）与调度器统计快照（JSON）。
+``{"task_id": "a", "sleep_ms": 10, "priority": 1, "max_queue_wait_ms": 500}``，
+其中 ``sleep_ms`` 为非负整数，``priority`` 为可选整数（缺省 0，不接受
+布尔值）；priority 数值较大的任务先派发给工作线程，相同数值按文件中的
+接受先后派发。``max_queue_wait_ms`` 为可选排队时限（毫秒），可省略或
+取 >= 1 的整数（bool、0、负数、浮点数、字符串均非法）；排队超过时限
+仍未被认领的任务不执行，结果对象只含 task_id 与 error（固定为
+QueueTimeoutError）。每个任务执行一次对应的空等待（``time.sleep``），
+完成后向标准输出打印任务结果（仍按输入顺序）与调度器统计快照（JSON）。
 
 以下情况在标准错误打印 ``InputValidationError`` 消息并以退出码 2 结束:
 JSON 非法、字段缺失或类型错误、sleep_ms 不是非负整数、priority 不是整数
-或为布尔值、task_id 重复或非法、并发参数非法，以及输入文件无法读取。
+或为布尔值、max_queue_wait_ms 非法、task_id 重复或非法、并发参数非法，
+以及输入文件无法读取。
 """
 
 from __future__ import annotations
@@ -23,12 +27,15 @@ import json
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from .errors import InputValidationError
+from .errors import InputValidationError, QueueTimeoutError
 from .scheduler import Scheduler
 
 _EXIT_INVALID = 2
+
+# results 中标记排队到期任务的哨兵（任务结果本身不会是该对象）。
+_QUEUE_TIMEOUT = object()
 
 
 def _parse_concurrency(value: str, name: str) -> int:
@@ -57,8 +64,17 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _load_tasks(path: str) -> List[Tuple[str, int, int]]:
-    """读取并校验任务文件，返回 (task_id, sleep_ms, priority) 列表（保持文件顺序）。"""
+def _is_positive_int(value: Any) -> bool:
+    # max_queue_wait_ms 只接受 >= 1 的整数，bool 予以拒绝。
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _load_tasks(path: str) -> List[Tuple[str, int, int, Optional[int]]]:
+    """读取并校验任务文件。
+
+    返回 (task_id, sleep_ms, priority, max_queue_wait_ms) 列表（保持文件
+    顺序）；max_queue_wait_ms 省略时为 None，表示不限排队时间。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -79,7 +95,7 @@ def _load_tasks(path: str) -> List[Tuple[str, int, int]]:
             % type(data).__name__
         )
 
-    tasks: List[Tuple[str, int, int]] = []
+    tasks: List[Tuple[str, int, int, Optional[int]]] = []
     seen: set[str] = set()
     for index, item in enumerate(data):
         if not isinstance(item, dict):
@@ -97,6 +113,7 @@ def _load_tasks(path: str) -> List[Tuple[str, int, int]]:
         task_id = item["task_id"]
         sleep_ms = item["sleep_ms"]
         priority_raw = item.get("priority", 0)
+        max_queue_wait_raw = item.get("max_queue_wait_ms", None)
         if not isinstance(task_id, str) or task_id == "":
             raise InputValidationError(
                 "task at index %d has invalid task_id: %r" % (index, task_id)
@@ -111,10 +128,16 @@ def _load_tasks(path: str) -> List[Tuple[str, int, int]]:
                 "task %r has invalid priority: %r (expected integer, bool not allowed)"
                 % (task_id, priority_raw)
             )
+        if (max_queue_wait_raw is not None
+                and not _is_positive_int(max_queue_wait_raw)):
+            raise InputValidationError(
+                "task %r has invalid max_queue_wait_ms: %r"
+                " (expected integer >= 1)" % (task_id, max_queue_wait_raw)
+            )
         if task_id in seen:
             raise InputValidationError("duplicate task_id: %r" % task_id)
         seen.add(task_id)
-        tasks.append((task_id, sleep_ms, priority_raw))
+        tasks.append((task_id, sleep_ms, priority_raw, max_queue_wait_raw))
     return tasks
 
 
@@ -158,21 +181,27 @@ def run(argv: "List[str] | None" = None) -> int:
     results: Dict[str, Any] = {}
     gate = threading.BoundedSemaphore(max_pending)
 
-    def run_one(task_id: str, sleep_ms: int, priority: int) -> None:
+    def run_one(task_id: str, sleep_ms: int, priority: int,
+                max_queue_wait_ms: Optional[int]) -> None:
         gate.acquire()
         try:
-            results[task_id] = scheduler.submit(
-                task_id, _make_wait(sleep_ms), priority=priority
-            )
+            try:
+                results[task_id] = scheduler.submit(
+                    task_id, _make_wait(sleep_ms), priority=priority,
+                    max_queue_wait_ms=max_queue_wait_ms,
+                )
+            except QueueTimeoutError:
+                # 排队到期：结果对象只携带固定的 error 标识。
+                results[task_id] = _QUEUE_TIMEOUT
         finally:
             gate.release()
 
     threads: List[threading.Thread] = []
     with Scheduler(workers=workers, max_pending=max_pending) as scheduler:
-        for task_id, sleep_ms, priority in tasks:
+        for task_id, sleep_ms, priority, max_queue_wait_ms in tasks:
             t = threading.Thread(
                 target=run_one,
-                args=(task_id, sleep_ms, priority),
+                args=(task_id, sleep_ms, priority, max_queue_wait_ms),
                 name="cli-submit",
             )
             t.start()
@@ -184,8 +213,12 @@ def run(argv: "List[str] | None" = None) -> int:
 
     output = {
         "results": [
-            {"task_id": task_id, "result": results[task_id]}
-            for task_id, _, _ in tasks
+            (
+                {"task_id": task_id, "error": "QueueTimeoutError"}
+                if results[task_id] is _QUEUE_TIMEOUT
+                else {"task_id": task_id, "result": results[task_id]}
+            )
+            for task_id, _, _, _ in tasks
         ],
         "stats": snapshot.to_dict(),
     }

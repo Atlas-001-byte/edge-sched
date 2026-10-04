@@ -14,6 +14,10 @@
   已完成、已取消、已拒绝任务一律不重排，任务只执行一次。
 - 已接受但尚未开始执行的任务可通过 submit_nowait 返回的 TaskHandle.cancel
   取消；取消与开始执行在同一把锁上决出唯一结果。
+- submit / submit_nowait 可携带可选的 max_queue_wait_ms 排队时限：按单调
+  时钟从任务被接受计到工作线程原子认领。到期任务进入 expired 终态，
+  callable 不执行，立即释放 max_pending 额度与 task_id；认领先发生时
+  任务执行到底，不受时限中断。到期、取消与认领并发时只产生一个终态。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
   已取消任务不阻塞关闭，已完成/已取消任务的结果在关闭后仍可读取。
 """
@@ -30,6 +34,7 @@ from .errors import (
     BackpressureError,
     DuplicateTaskError,
     InputValidationError,
+    QueueTimeoutError,
     SchedulerClosedError,
     TaskCancelledError,
 )
@@ -47,12 +52,14 @@ _DISPATCH_POLL = 0.05
 class _TaskEntry:
     """一个任务的全部可变状态。
 
-    取消与执行的唯一裁决依赖两个受 Scheduler._cond 保护的标志：
+    取消、到期与执行的唯一裁决依赖三个受 Scheduler._cond 保护的标志：
 
     - ``started``：工作线程已在锁内认领任务、即将执行 callable。
     - ``cancelled``：任务已在锁内被取消，进入取消终态。
+    - ``expired``：任务排队超过 ``deadline`` 仍未被认领，进入到期终态。
 
-    二者在同一把锁上以先到者为准，故每个任务只可能有一种终态。
+    三者在同一把锁上以先到者为准，故每个任务只可能有一种终态。
+    ``deadline`` 为单调时钟下的到期时刻（无排队时限时为 None）。
     """
 
     __slots__ = (
@@ -61,28 +68,33 @@ class _TaskEntry:
         "priority",
         "seq",
         "submit_time",
+        "deadline",
         "done",
         "success",
         "value",
         "exception",
         "started",
         "cancelled",
+        "expired",
     )
 
     def __init__(self, task_id: str, fn: Callable[[], Any],
-                 submit_time: float, priority: int, seq: int) -> None:
+                 submit_time: float, priority: int, seq: int,
+                 deadline: Optional[float] = None) -> None:
         self.task_id = task_id
         self.fn = fn
         self.priority = priority
         # 接受序号：同优先级时严格按接受先后（FCFS）派发。
         self.seq = seq
         self.submit_time = submit_time
+        self.deadline = deadline
         self.done = threading.Event()
         self.success = False
         self.value: Any = None
         self.exception: Optional[BaseException] = None
         self.started = False
         self.cancelled = False
+        self.expired = False
 
 
 class TaskHandle:
@@ -108,10 +120,11 @@ class TaskHandle:
         - 任务尚未开始：取消成功，callable 完全不执行，返回 True；
           此后 :meth:`done` 为 True，:meth:`result` 抛
           :class:`TaskCancelledError`。
-        - 任务已经开始执行或已有终态（含已被取消）：返回 False，
+        - 任务已经开始执行或已有终态（含已被取消、已到期）：返回 False，
           原终态与结果不受影响。
 
-        与“开始执行”竞争时，由调度器在同一原子边界决定唯一结果。
+        与“开始执行”及“排队到期”竞争时，由调度器在同一原子边界决定
+        唯一结果。
         """
         return self._scheduler._cancel(self._entry)
 
@@ -120,6 +133,7 @@ class TaskHandle:
 
         - 成功：返回 callable 的返回值；失败：抛出 callable 抛出的原始异常。
         - 被取消：抛出 :class:`TaskCancelledError`。
+        - 排队到期：抛出 :class:`QueueTimeoutError`。
         - ``timeout`` 为 None 时一直等待；有限超时内未结束则抛
           :class:`TimeoutError`，任务本身继续执行，之后仍可再次读取结果。
         """
@@ -211,18 +225,21 @@ class Scheduler:
 
     def submit(self, task_id: str, fn: Callable[[], T],
                timeout: Optional[float] = None,
-               priority: int = 0) -> T:
+               priority: int = 0,
+               max_queue_wait_ms: Optional[int] = None) -> T:
         """提交任务并阻塞等待结果。
 
         结果语义（每个任务只可能有一种）:
 
         - 成功：返回 callable 的返回值。
         - 失败：抛出 callable 抛出的**原始异常**；任务计入 failed。
+        - 排队超过 ``max_queue_wait_ms`` 仍未被工作线程认领：抛
+          :class:`QueueTimeoutError`，callable 不执行，任务计入 expired。
         - 未完成任务数已达上限：抛 :class:`BackpressureError`，无结果无统计。
         - task_id 与未完成任务重复：抛 :class:`DuplicateTaskError`。
         - 调度器已关闭：抛 :class:`SchedulerClosedError`。
-        - 参数非法（含 priority 非整数或为布尔值）：抛
-          :class:`InputValidationError`。
+        - 参数非法（含 priority 非整数或为布尔值、max_queue_wait_ms 非法）：
+          抛 :class:`InputValidationError`。
         - 等待超过 ``timeout`` 秒：抛 :class:`TimeoutError`，任务仍继续执行，
           其最终结果不受影响。
 
@@ -233,12 +250,16 @@ class Scheduler:
         :param priority: 可选整数优先级，缺省 0；数值越大越早被派发给
             工作线程，相同数值按接受先后派发。优先级只影响尚未开始执行
             的任务的派发顺序，不抢占执行中的任务。
+        :param max_queue_wait_ms: 可选排队时限（毫秒），缺省 None 表示
+            不限排队时间；只能为 None 或 >= 1 的整数（bool 非法）。
+            时限按单调时钟从任务被接受计到工作线程原子认领；
+            认领先发生则任务执行到底，不受时限中断。
         """
         if timeout is not None and timeout < 0:
             raise InputValidationError(
                 "timeout must be >= 0 or None, got %r" % (timeout,)
             )
-        entry = self._admit(task_id, fn, priority)
+        entry = self._admit(task_id, fn, priority, max_queue_wait_ms)
 
         if not entry.done.wait(timeout):
             raise TimeoutError(
@@ -250,19 +271,24 @@ class Scheduler:
         raise entry.exception
 
     def submit_nowait(self, task_id: str, fn: Callable[[], T],
-                      priority: int = 0) -> TaskHandle:
+                      priority: int = 0,
+                      max_queue_wait_ms: Optional[int] = None) -> TaskHandle:
         """提交任务并立即返回句柄，不等待 callable 执行结束。
 
-        准入校验与 :meth:`submit` 完全一致（参数校验、priority 校验、关闭、
-        重复 task_id、背压），通过后任务进入同一事件循环，由工作线程按
-        “priority 降序、同优先级按接受先后”派发；返回前 accepted 计数已更新。
-        任务进度与结果通过返回的 :class:`TaskHandle` 查询。
+        准入校验与 :meth:`submit` 完全一致（参数校验、priority 与
+        max_queue_wait_ms 校验、关闭、重复 task_id、背压），通过后任务进入
+        同一事件循环，由工作线程按“priority 降序、同优先级按接受先后”派发；
+        返回前 accepted 计数已更新。任务进度与结果通过返回的
+        :class:`TaskHandle` 查询；排队到期任务的 :meth:`TaskHandle.result`
+        抛 :class:`QueueTimeoutError`。
 
         :param task_id: 非空字符串，任务唯一标识。
         :param fn: 无参数 callable。
         :param priority: 可选整数优先级，缺省 0，语义同 :meth:`submit`。
+        :param max_queue_wait_ms: 可选排队时限（毫秒），缺省 None 不限，
+            语义同 :meth:`submit`。
         """
-        entry = self._admit(task_id, fn, priority)
+        entry = self._admit(task_id, fn, priority, max_queue_wait_ms)
         return TaskHandle(self, entry)
 
     def result(self, task_id: str) -> Any:
@@ -270,6 +296,7 @@ class Scheduler:
 
         - 成功：返回 callable 的返回值；失败：重新抛出其原始异常。
         - 任务在开始前被取消：抛 :class:`TaskCancelledError`。
+        - 任务排队到期未被认领：抛 :class:`QueueTimeoutError`。
         - 任务尚未结束：抛 :class:`RuntimeError`。
         - 从未接受过该 task_id：抛 :class:`KeyError`。
 
@@ -338,7 +365,8 @@ class Scheduler:
     # ------------------------------------------------------------- internals
 
     def _admit(self, task_id: str, fn: Callable[[], Any],
-               priority: int = 0) -> "_TaskEntry":
+               priority: int = 0,
+               max_queue_wait_ms: Optional[int] = None) -> "_TaskEntry":
         """校验参数并完成准入：登记任务、更新计数、放入入站堆。
 
         submit 与 submit_nowait 共用；任何失败路径都不产生任务条目，
@@ -354,6 +382,12 @@ class Scheduler:
             raise InputValidationError(
                 "priority must be an integer (bool not allowed), got %r"
                 % (priority,)
+            )
+        if (max_queue_wait_ms is not None
+                and not self._is_positive_int(max_queue_wait_ms)):
+            raise InputValidationError(
+                "max_queue_wait_ms must be an integer >= 1 or None, got %r"
+                % (max_queue_wait_ms,)
             )
 
         with self._cond:
@@ -371,8 +405,14 @@ class Scheduler:
 
             seq = self._accept_seq
             self._accept_seq += 1
+            submit_time = time.monotonic()
+            # 排队时限的到期时刻（单调时钟）；None 表示不限排队时间。
+            deadline = (
+                None if max_queue_wait_ms is None
+                else submit_time + max_queue_wait_ms / 1000.0
+            )
             entry = _TaskEntry(
-                task_id, fn, time.monotonic(), priority, seq
+                task_id, fn, submit_time, priority, seq, deadline
             )
             self._tasks[task_id] = entry
             self._unfinished.add(task_id)
@@ -390,14 +430,16 @@ class Scheduler:
         return entry
 
     def _cancel(self, entry: "_TaskEntry") -> bool:
-        """取消一个已接受任务；仅在任务尚未开始执行时成功。
+        """取消一个已接受任务；仅在任务尚未开始执行且未到期时成功。
 
-        与工作线程的“认领”操作共用 _cond：认领置 started、取消置
-        cancelled，先到者在锁内决定唯一终态。取消成功即释放 pending
-        额度与 task_id 占用、计入 cancelled 并唤醒等待方。
+        与工作线程的“认领”及“到期”操作共用 _cond：认领置 started、
+        取消置 cancelled、到期置 expired，先到者在锁内决定唯一终态。
+        取消成功即释放 pending 额度与 task_id 占用、计入 cancelled
+        并唤醒等待方。
         """
         with self._cond:
-            if entry.started or entry.cancelled or entry.done.is_set():
+            if (entry.started or entry.cancelled or entry.expired
+                    or entry.done.is_set()):
                 return False
             entry.cancelled = True
             entry.exception = TaskCancelledError(
@@ -412,10 +454,74 @@ class Scheduler:
         entry.done.set()
         return True
 
-    def _prune_cancelled_locked(self) -> None:
-        """丢弃堆顶连续的已取消惰性令牌；调用时须持有 ``_inbound_cond``。
+    def _expire_locked(self, entry: "_TaskEntry") -> bool:
+        """把未认领任务推进到 expired 终态；调用时须持有 ``_cond``。
 
-        已取消条目可能埋在未取消条目之下——那种情况下它不影响堆顶选择，
+        与认领（started）、取消（cancelled）在同一把锁上先到者先赢；
+        返回是否由本次调用完成迁移（False 表示任务已有其他终态）。
+        到期即释放 pending 额度与 task_id 占用、计入 expired 并唤醒等待方。
+        """
+        if (entry.started or entry.cancelled or entry.expired
+                or entry.done.is_set()):
+            return False
+        entry.expired = True
+        entry.exception = QueueTimeoutError(
+            "task %r exceeded max_queue_wait_ms before being claimed"
+            % (entry.task_id,)
+        )
+        self._pending -= 1
+        self._unfinished.discard(entry.task_id)
+        self._stats.record_expired()
+        self._cond.notify_all()
+        return True
+
+    def _expire_due_locked(self) -> None:
+        """把堆中所有已到期的排队任务推进到 expired 终态；调用时须持有
+        ``_inbound_cond``。
+
+        到期判定与状态迁移在 _cond 内与认领/取消决出唯一结果；
+        堆中其余位置的到期令牌留待弹出时按 done 丢弃。
+        """
+        now = time.monotonic()
+        due = [
+            entry for _, _, entry in self._inbound
+            if entry.deadline is not None and entry.deadline <= now
+            and not entry.done.is_set()
+        ]
+        if not due:
+            return
+        expired = []
+        with self._cond:
+            for entry in due:
+                if self._expire_locked(entry):
+                    expired.append(entry)
+        # done 在锁外置位：结果字段与计数在锁内已全部落定。
+        for entry in expired:
+            entry.done.set()
+
+    def _next_expire_delay_locked(self) -> Optional[float]:
+        """堆中最近到期时刻距现在的秒数；无排队时限任务时返回 None。
+
+        调用时须持有 ``_inbound_cond``。用于让事件循环在最近到期点
+        醒来处理到期任务，即使此刻没有空闲工作线程许可。
+        """
+        now = time.monotonic()
+        earliest: Optional[float] = None
+        for _, _, entry in self._inbound:
+            deadline = entry.deadline
+            if deadline is None or entry.done.is_set():
+                continue
+            if earliest is None or deadline < earliest:
+                earliest = deadline
+        if earliest is None:
+            return None
+        return max(0.0, earliest - now)
+
+    def _prune_cancelled_locked(self) -> None:
+        """丢弃堆顶连续的已结束（取消或到期）惰性令牌；调用时须持有
+        ``_inbound_cond``。
+
+        已结束条目可能埋在未结束条目之下——那种情况下它不影响堆顶选择，
         留待将来弹到堆顶时再丢弃即可，故只需从堆顶清理。
         """
         while self._inbound and self._inbound[0][2].done.is_set():
@@ -425,14 +531,23 @@ class Scheduler:
         """弹出并返回当前堆中最高优先级的未结束任务，调用时须持有
         ``_inbound_cond``。
 
-        等待派发期间被取消任务的惰性令牌会被依次丢弃（堆顶剪枝之外，
-        弹出的条目也再确认一次 ``done``，以覆盖与取消线程的最后窗口）；
-        堆中没有可派发任务时返回 None。
+        等待派发期间被取消/到期任务的惰性令牌会被依次丢弃（堆顶剪枝之外，
+        弹出的条目也再确认一次 ``done``，以覆盖与取消/到期线程的最后
+        窗口）；弹出窗口内新到期的任务在此直接推进到 expired 终态，
+        不再派发。堆中没有可派发任务时返回 None。
         """
         while self._inbound:
             _, _, entry = heapq.heappop(self._inbound)
-            if not entry.done.is_set():
-                return entry
+            if entry.done.is_set():
+                continue
+            if (entry.deadline is not None
+                    and entry.deadline <= time.monotonic()):
+                with self._cond:
+                    expired = self._expire_locked(entry)
+                if expired:
+                    entry.done.set()
+                continue
+            return entry
         return None
 
     def _run_dispatcher(self) -> None:
@@ -441,27 +556,45 @@ class Scheduler:
         顺序为 priority 降序、同优先级按接受先后（FCFS）。关键次序是
         “先取得许可、再在堆顶选取”：若先选定任务再等许可，先入队的低
         优先级任务会占住派发位置，挡住后到的高优先级任务。
+
+        排队时限由事件循环主动推进：等待许可以最近到期点为上限（且不超过
+        轮询间隔），到期点醒来时即使没有空闲许可、没有新提交，也会把
+        到期任务推进到 expired 终态，及时释放 pending 额度。
         """
         while not self._stop_dispatcher.is_set():
             with self._inbound_cond:
                 self._prune_cancelled_locked()
+                self._expire_due_locked()
                 while (not self._stop_dispatcher.is_set()
                        and not self._inbound):
                     self._inbound_cond.wait(_DISPATCH_POLL)
                     self._prune_cancelled_locked()
+                    self._expire_due_locked()
                 if self._stop_dispatcher.is_set():
                     return
+                delay = self._next_expire_delay_locked()
 
             # 取得一个空闲工作线程许可后再选取任务，保证选出的任务立即
             # 有线程可以执行；就绪队列中至多有 workers 个待执行任务。
-            self._worker_slots.acquire()
+            if delay is None:
+                self._worker_slots.acquire()
+                acquired = True
+            else:
+                # 有排队时限任务：许可等待以最近到期点为限，确保到期
+                # 任务被及时处理，而不是无限期阻塞在许可上。
+                acquired = self._worker_slots.acquire(
+                    timeout=min(delay, _DISPATCH_POLL)
+                )
+            if not acquired:
+                # 许可等待期间到达到期点：回循环开头先处理到期任务。
+                continue
             if self._stop_dispatcher.is_set():
                 self._worker_slots.release()
                 return
             with self._inbound_cond:
                 entry = self._pop_next_locked()
             if entry is None:
-                # 等待许可期间堆中的任务已全部被取消：归还许可继续循环。
+                # 等待许可期间堆中的任务已全部被取消/到期：归还许可继续循环。
                 self._worker_slots.release()
                 continue
             self._ready.put(entry)
@@ -474,14 +607,25 @@ class Scheduler:
                 return
             entry: "_TaskEntry" = item
 
-            # 原子认领：与 cancel 在同一把锁上决出唯一结果。
-            # 认领成功（置 started）后 callable 必执行到底，cancel 必失败；
-            # 已取消则 callable 绝不执行，立即归还许可。
+            # 原子认领：与 cancel、排队到期在同一把锁上决出唯一结果。
+            # 认领成功（置 started）后 callable 必执行到底，cancel 必失败、
+            # 时限不再生效；已取消/已到期则 callable 绝不执行，立即归还许可。
+            expired = False
             with self._cond:
-                if entry.cancelled:
+                if entry.cancelled or entry.expired:
                     self._worker_slots.release()
                     continue
-                entry.started = True
+                if (entry.deadline is not None
+                        and time.monotonic() >= entry.deadline):
+                    # 认领发生前已到期：进入 expired 终态，callable 不执行。
+                    self._expire_locked(entry)
+                    expired = True
+                else:
+                    entry.started = True
+            if expired:
+                self._worker_slots.release()
+                entry.done.set()
+                continue
 
             start_time = time.monotonic()
             try:

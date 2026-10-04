@@ -9,6 +9,7 @@ from edge_sched import (
     DuplicateTaskError,
     EdgeSchedError,
     InputValidationError,
+    QueueTimeoutError,
     Scheduler,
     SchedulerClosedError,
     TaskCancelledError,
@@ -906,6 +907,222 @@ class CancelTest(unittest.TestCase):
         finished = snap.completed + snap.failed
         self.assertEqual(len(_samples(snap, "wait")), finished)
         self.assertEqual(len(_samples(snap, "total")), finished)
+
+
+class QueueTimeoutTest(unittest.TestCase):
+    """max_queue_wait_ms 排队时限：到期、互斥与统计口径。"""
+
+    def test_invalid_max_queue_wait_ms(self) -> None:
+        # 只能为 None 或 >= 1 的整数；bool/0/负数/浮点/字符串均非法。
+        with Scheduler(workers=1, max_pending=2) as s:
+            for bad in (True, False, 0, -1, 1.5, "10", 0.5):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(InputValidationError):
+                        s.submit("t", lambda: None,
+                                 max_queue_wait_ms=bad)  # type: ignore[arg-type]
+                    with self.assertRaises(InputValidationError):
+                        s.submit_nowait(
+                            "u", lambda: None,
+                            max_queue_wait_ms=bad,  # type: ignore[arg-type]
+                        )
+        # 校验失败不留统计痕迹。
+        snap = s.snapshot()
+        self.assertEqual(
+            (snap.accepted, snap.expired, snap.completed),
+            (0, 0, 0),
+        )
+
+    def test_none_and_positive_int_accepted(self) -> None:
+        with Scheduler(workers=1, max_pending=4) as s:
+            self.assertEqual(
+                s.submit("a", lambda: 1, max_queue_wait_ms=None), 1
+            )
+            self.assertEqual(
+                s.submit("b", lambda: 2, max_queue_wait_ms=5000), 2
+            )
+            self.assertEqual(
+                s.submit_nowait("c", lambda: 3,
+                                max_queue_wait_ms=100000).result(), 3
+            )
+        self.assertEqual(s.snapshot().expired, 0)
+
+    def test_max_queue_wait_validated_before_close_check(self) -> None:
+        s = Scheduler(workers=1, max_pending=1)
+        s.close()
+        with self.assertRaises(InputValidationError):
+            s.submit("t", lambda: None, max_queue_wait_ms=0)
+        with self.assertRaises(SchedulerClosedError):
+            s.submit("t", lambda: None, max_queue_wait_ms=1)
+
+    def test_submit_expires_while_queued(self) -> None:
+        # 唯一工作线程被占住，排队任务到期：submit 抛 QueueTimeoutError，
+        # callable 完全不执行。
+        release = threading.Event()
+        ran: list[str] = []
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "hold"))
+            with self.assertRaises(QueueTimeoutError) as cm:
+                s.submit("q", lambda: ran.append("q"),
+                         max_queue_wait_ms=40)
+            self.assertIsInstance(cm.exception, EdgeSchedError)
+            self.assertEqual(ran, [])
+            release.set()
+            self.assertTrue(holder.result())
+
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, 2)
+        self.assertEqual(snap.expired, 1)
+        self.assertEqual(snap.completed, 1)
+        self.assertEqual(snap.failed, 0)
+        self.assertEqual(snap.cancelled, 0)
+        # 到期任务不贡献延迟样本。
+        self.assertEqual(len(_samples(snap, "wait")), 1)
+        self.assertEqual(len(_samples(snap, "total")), 1)
+
+    def test_handle_and_scheduler_result_raise_queue_timeout(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2) as s:
+            holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "hold"))
+            h = s.submit_nowait("x", lambda: "never", max_queue_wait_ms=30)
+            with self.assertRaises(QueueTimeoutError):
+                h.result()
+            self.assertTrue(h.done())
+            with self.assertRaises(QueueTimeoutError):
+                s.result("x")
+            # 到期后 cancel 返回 False，终态不变。
+            self.assertFalse(h.cancel())
+            with self.assertRaises(QueueTimeoutError):
+                h.result()
+            release.set()
+            self.assertTrue(holder.result())
+        # 关闭后到期终态仍可读取。
+        with self.assertRaises(QueueTimeoutError):
+            s.result("x")
+        self.assertEqual(s.snapshot().expired, 1)
+
+    def test_expiry_frees_pending_and_task_id(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2) as s:
+            holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "hold"))
+            hx = s.submit_nowait("x", lambda: None, max_queue_wait_ms=30)
+            self.assertTrue(_wait_accepted(s, 2))
+            # 上限已满，新提交被背压拒绝。
+            with self.assertRaises(BackpressureError):
+                s.submit_nowait("blocked", lambda: None)
+            with self.assertRaises(QueueTimeoutError):
+                hx.result()
+            # 到期立即释放 pending 额度与 task_id：同名任务可再提交。
+            hx2 = s.submit_nowait("x", lambda: "reused")
+            release.set()
+            self.assertTrue(holder.result())
+            self.assertEqual(hx2.result(), "reused")
+        snap = s.snapshot()
+        self.assertEqual(
+            (snap.accepted, snap.expired, snap.completed, snap.rejected),
+            (3, 1, 2, 1),
+        )
+
+    def test_claimed_task_runs_to_completion_past_deadline(self) -> None:
+        # 认领先于到期点发生：任务执行到底，不受时限中断。
+        def slow() -> str:
+            time.sleep(0.1)
+            return "done"
+
+        with Scheduler(workers=1, max_pending=2) as s:
+            self.assertEqual(
+                s.submit("s", slow, max_queue_wait_ms=20), "done"
+            )
+        snap = s.snapshot()
+        self.assertEqual(snap.expired, 0)
+        self.assertEqual(snap.completed, 1)
+
+    def test_expiry_without_new_submissions_close_not_blocked(self) -> None:
+        # 无后续提交时事件循环也及时完成到期；close 不会永久阻塞。
+        release = threading.Event()
+        s = Scheduler(workers=1, max_pending=4)
+        holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+        self.assertTrue(_wait_started(s, "hold"))
+        handles = [
+            s.submit_nowait("q%d" % i, lambda: None, max_queue_wait_ms=30)
+            for i in range(3)
+        ]
+        for h in handles:
+            with self.assertRaises(QueueTimeoutError):
+                h.result(timeout=2.0)
+        release.set()
+        self.assertTrue(holder.result())
+        start = time.monotonic()
+        s.close()
+        self.assertLess(time.monotonic() - start, 2.0)
+        snap = s.snapshot()
+        self.assertEqual(snap.expired, 3)
+        self.assertEqual(snap.completed, 1)
+
+    def test_cancel_before_expiry_still_cancelled(self) -> None:
+        # 未到期时手工取消：仍进入取消终态而非到期终态。
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=2) as s:
+            holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+            self.assertTrue(_wait_started(s, "hold"))
+            h = s.submit_nowait("c", lambda: None, max_queue_wait_ms=5000)
+            self.assertTrue(h.cancel())
+            with self.assertRaises(TaskCancelledError):
+                h.result()
+            release.set()
+            self.assertTrue(holder.result())
+        snap = s.snapshot()
+        self.assertEqual(snap.cancelled, 1)
+        self.assertEqual(snap.expired, 0)
+
+    def test_cancel_vs_expire_race_has_single_outcome(self) -> None:
+        # 大量任务在到期窗口与 cancel 竞争：每个任务必须恰好落入
+        # “执行完成 / 被取消 / 已到期”之一，统计口径与终态完全一致。
+        n = 100
+        s = Scheduler(workers=1, max_pending=n + 2)
+        release = threading.Event()
+        holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+        self.assertTrue(_wait_started(s, "hold"))
+        handles = [
+            s.submit_nowait("t%d" % i, lambda: None, max_queue_wait_ms=100)
+            for i in range(n)
+        ]
+
+        cancelers = [threading.Thread(target=h.cancel) for h in handles]
+        for t in cancelers:
+            t.start()
+        for t in cancelers:
+            t.join()
+        release.set()
+        self.assertTrue(holder.result())
+        s.close()
+
+        outcomes = {"ran": 0, "cancelled": 0, "expired": 0}
+        for h in handles:
+            self.assertFalse(h.cancel())  # 终态之后取消必失败
+            try:
+                h.result()
+                outcomes["ran"] += 1
+            except TaskCancelledError:
+                outcomes["cancelled"] += 1
+            except QueueTimeoutError:
+                outcomes["expired"] += 1
+
+        snap = s.snapshot()
+        self.assertEqual(snap.accepted, n + 1)
+        self.assertEqual(snap.cancelled, outcomes["cancelled"])
+        self.assertEqual(snap.expired, outcomes["expired"])
+        # +1 为占位任务 holder。
+        self.assertEqual(snap.completed, outcomes["ran"] + 1)
+        self.assertEqual(
+            snap.completed + snap.failed + snap.cancelled + snap.expired,
+            n + 1,
+        )
+        self.assertEqual(len(_samples(snap, "wait")), snap.completed)
+        self.assertEqual(len(_samples(snap, "total")), snap.completed)
 
 
 def _wait_started(s: Scheduler, task_id: str) -> bool:

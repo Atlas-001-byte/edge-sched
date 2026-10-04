@@ -10,7 +10,8 @@
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
   :class:`~edge_sched.errors.InputValidationError` /
-  :class:`~edge_sched.errors.TaskCancelledError`
+  :class:`~edge_sched.errors.TaskCancelledError` /
+  :class:`~edge_sched.errors.QueueTimeoutError`
 """
 
 from .errors import (
@@ -18,6 +19,7 @@ from .errors import (
     DuplicateTaskError,
     EdgeSchedError,
     InputValidationError,
+    QueueTimeoutError,
     SchedulerClosedError,
     TaskCancelledError,
 )
@@ -35,6 +37,7 @@ __all__ = [
     "SchedulerClosedError",
     "InputValidationError",
     "TaskCancelledError",
+    "QueueTimeoutError",
 ]
 
 __version__ = "0.1.0"

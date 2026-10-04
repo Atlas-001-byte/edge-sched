@@ -62,6 +62,7 @@ class Stats:
         self._completed = 0
         self._failed = 0
         self._cancelled = 0
+        self._expired = 0
         self._rejected = 0
         self._queue_wait: List[float] = []
         self._total_latency: List[float] = []
@@ -78,6 +79,11 @@ class Stats:
         """记录一个在开始执行前被取消的任务：计入 cancelled，无延迟样本。"""
         with self._lock:
             self._cancelled += 1
+
+    def record_expired(self) -> None:
+        """记录一个排队到期未被认领的任务：计入 expired，无延迟样本。"""
+        with self._lock:
+            self._expired += 1
 
     def record_finished(self, queue_wait_ms: float, total_latency_ms: float,
                         success: bool) -> None:
@@ -98,6 +104,7 @@ class Stats:
                 completed=self._completed,
                 failed=self._failed,
                 cancelled=self._cancelled,
+                expired=self._expired,
                 rejected=self._rejected,
                 queue_wait_samples=list(self._queue_wait),
                 total_latency_samples=list(self._total_latency),
@@ -112,19 +119,21 @@ class StatsSnapshot:
         "completed",
         "failed",
         "cancelled",
+        "expired",
         "rejected",
         "_queue_wait_samples",
         "_total_latency_samples",
     )
 
     def __init__(self, *, accepted: int, completed: int, failed: int,
-                 cancelled: int, rejected: int,
+                 cancelled: int, expired: int, rejected: int,
                  queue_wait_samples: List[float],
                  total_latency_samples: List[float]) -> None:
         self.accepted = accepted
         self.completed = completed
         self.failed = failed
         self.cancelled = cancelled
+        self.expired = expired
         self.rejected = rejected
         self._queue_wait_samples = list(queue_wait_samples)
         self._total_latency_samples = list(total_latency_samples)
@@ -144,6 +153,7 @@ class StatsSnapshot:
             "completed": self.completed,
             "failed": self.failed,
             "cancelled": self.cancelled,
+            "expired": self.expired,
             "rejected": self.rejected,
             "queue_wait_ms": self.queue_wait_ms,
             "total_latency_ms": self.total_latency_ms,
@@ -152,10 +162,10 @@ class StatsSnapshot:
     def __repr__(self) -> str:  # pragma: no cover - 调试辅助
         return (
             "StatsSnapshot(accepted={a}, completed={c}, failed={f}, "
-            "cancelled={cn}, rejected={r}, queue_wait_ms={qw}, "
+            "cancelled={cn}, expired={e}, rejected={r}, queue_wait_ms={qw}, "
             "total_latency_ms={tl})".format(
                 a=self.accepted, c=self.completed, f=self.failed,
-                cn=self.cancelled, r=self.rejected, qw=self.queue_wait_ms,
-                tl=self.total_latency_ms,
+                cn=self.cancelled, e=self.expired, r=self.rejected,
+                qw=self.queue_wait_ms, tl=self.total_latency_ms,
             )
         )

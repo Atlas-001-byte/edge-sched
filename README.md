@@ -13,6 +13,14 @@
   （缺省 0，`bool` 非法）；数值大的任务先派发给工作线程，相同数值按接受
   先后派发。优先级只影响已接受但尚未开始执行的任务，不抢占执行中任务；
   CLI 任务可提供 `priority` 字段，结果数组仍按输入顺序返回。
+- 增量：可选排队时限。`submit` / `submit_nowait` 支持可选
+  `max_queue_wait_ms`（置于 `priority` 后，只能为 `None` 或 >= 1 的整数，
+  `bool` 非法，`None` 表示不限排队时间）；时限按单调时钟从任务被接受计到
+  工作线程原子认领，到期任务进入 expired 终态（callable 不执行，立即释放
+  `max_pending` 额度与 task_id），读取其结果抛 `QueueTimeoutError`；认领
+  先发生则任务执行到底。到期任务计入 `accepted` 与新增的 `expired` 统计，
+  不贡献延迟样本；CLI 任务可提供 `max_queue_wait_ms` 字段，到期任务的
+  结果对象只含 `task_id` 与 `error`（固定为 `QueueTimeoutError`）。
 
 ## 约定
 
