@@ -87,6 +87,12 @@ class CliValidationTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("InputValidationError", err.getvalue())
 
+    def test_bad_priority_types(self) -> None:
+        for bad in (1.5, "2", True, False, None, [1]):
+            self._expect_exit_2(
+                [{"task_id": "a", "sleep_ms": 0, "priority": bad}]
+            )
+
     def test_element_not_object(self) -> None:
         self._expect_exit_2([1, 2])
 
@@ -151,6 +157,23 @@ class CliSuccessTest(unittest.TestCase):
         )
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
+
+    def test_priority_optional_default_zero_and_output_input_order(self) -> None:
+        # priority 缺省或为负都合法；结果数组严格按输入顺序返回，
+        # 不按优先级重排，且结果对象不新增字段。
+        tasks = [
+            {"task_id": "low", "sleep_ms": 0, "priority": -5},
+            {"task_id": "mid", "sleep_ms": 0},
+            {"task_id": "high", "sleep_ms": 0, "priority": 9},
+        ]
+        report = self._execute(tasks, workers=1, max_pending=3)
+        self.assertEqual(
+            [r["task_id"] for r in report["results"]],
+            ["low", "mid", "high"],
+        )
+        for r in report["results"]:
+            self.assertEqual(set(r), {"task_id", "result"})
+        self.assertEqual(report["stats"]["completed"], 3)
 
 
 class CliModuleTest(unittest.TestCase):

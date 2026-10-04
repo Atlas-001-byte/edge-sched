@@ -98,6 +98,182 @@ class BasicExecutionTest(unittest.TestCase):
         raise ValueError("x")
 
 
+class PriorityTest(unittest.TestCase):
+    @staticmethod
+    def _make_recorder(tid: str, order: list,
+                       order_lock: threading.Lock) -> "any":
+        def fn() -> str:
+            with order_lock:
+                order.append(tid)
+            return tid
+        return fn
+
+    def test_higher_priority_dispatched_first(self) -> None:
+        # 单工作线程被占住时，按 low -> mid -> high 顺序提交；
+        # 放行后必须严格按 high -> mid -> low 执行，而非提交顺序。
+        order: list[str] = []
+        order_lock = threading.Lock()
+        entered = threading.Event()
+        worker_free = threading.Event()
+
+        def occupy() -> None:
+            entered.set()
+            worker_free.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=8) as s:
+            holder = threading.Thread(target=s.submit, args=("_", occupy))
+            holder.start()
+            self.assertTrue(entered.wait(2.0))
+            threads = []
+            for tid, prio in (("low", 0), ("mid", 5), ("high", 10)):
+                t = threading.Thread(
+                    target=lambda tid=tid, p=prio: s.submit(
+                        tid, self._make_recorder(tid, order, order_lock),
+                        priority=p,
+                    )
+                )
+                t.start()
+                threads.append(t)
+                time.sleep(0.03)  # 固定提交顺序 low -> mid -> high
+            self.assertTrue(_wait_accepted(s, 4))
+            worker_free.set()
+            holder.join()
+            for t in threads:
+                t.join()
+        self.assertEqual(order, ["high", "mid", "low"])
+
+    def test_same_priority_keeps_acceptance_order(self) -> None:
+        # 相同优先级按接受先后派发；不同优先级之间高优先级整体提前。
+        order: list[str] = []
+        order_lock = threading.Lock()
+        entered = threading.Event()
+        worker_free = threading.Event()
+
+        def occupy() -> None:
+            entered.set()
+            worker_free.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=8) as s:
+            holder = threading.Thread(target=s.submit, args=("_", occupy))
+            holder.start()
+            self.assertTrue(entered.wait(2.0))
+            threads = []
+            for tid, prio in (("a", 1), ("b", 1), ("c", 2), ("d", 0)):
+                t = threading.Thread(
+                    target=lambda tid=tid, p=prio: s.submit(
+                        tid, self._make_recorder(tid, order, order_lock),
+                        priority=p,
+                    )
+                )
+                t.start()
+                threads.append(t)
+                time.sleep(0.03)
+            self.assertTrue(_wait_accepted(s, 5))
+            worker_free.set()
+            holder.join()
+            for t in threads:
+                t.join()
+        self.assertEqual(order, ["c", "a", "b", "d"])
+
+    def test_default_priority_is_zero_and_negative_accepted(self) -> None:
+        with Scheduler(workers=2, max_pending=4) as s:
+            self.assertEqual(s.submit("z", lambda: 1), 1)
+            self.assertEqual(
+                s.submit("n", lambda: -1, priority=-100), -1
+            )
+
+    def test_priority_does_not_preempt_running_task(self) -> None:
+        # 低优先级任务一旦开始执行，后到的高优先级任务只能等它结束，
+        # 优先级不重排执行中任务。
+        started = threading.Event()
+        release = threading.Event()
+        order: list[str] = []
+        lock = threading.Lock()
+
+        def low() -> None:
+            with lock:
+                order.append("low-start")
+            started.set()
+            release.wait(2.0)
+            with lock:
+                order.append("low-end")
+
+        def high() -> None:
+            with lock:
+                order.append("high")
+
+        with Scheduler(workers=1, max_pending=4) as s:
+            hl = s.submit_nowait("low", low, priority=-5)
+            self.assertTrue(started.wait(2.0))
+            hh = s.submit_nowait("high", high, priority=100)
+            time.sleep(0.1)
+            with lock:
+                self.assertEqual(order, ["low-start"])
+            release.set()
+            self.assertIsNone(hh.result())
+            self.assertIsNone(hl.result())
+        self.assertEqual(order, ["low-start", "low-end", "high"])
+
+    def test_cancelled_skipped_then_next_priority_runs(self) -> None:
+        # 最高优先级任务在排队中被取消后，派发落到次高优先级任务。
+        order: list[str] = []
+        order_lock = threading.Lock()
+        entered = threading.Event()
+        worker_free = threading.Event()
+
+        def occupy() -> None:
+            entered.set()
+            worker_free.wait(2.0)
+
+        with Scheduler(workers=1, max_pending=8) as s:
+            holder = threading.Thread(target=s.submit, args=("_", occupy))
+            holder.start()
+            self.assertTrue(entered.wait(2.0))
+            h_low = s.submit_nowait(
+                "low", self._make_recorder("low", order, order_lock),
+                priority=0,
+            )
+            h_high = s.submit_nowait(
+                "high", self._make_recorder("high", order, order_lock),
+                priority=10,
+            )
+            self.assertTrue(h_high.cancel())
+            worker_free.set()
+            holder.join()
+            self.assertEqual(h_low.result(), "low")
+            with self.assertRaises(TaskCancelledError):
+                h_high.result()
+        self.assertEqual(order, ["low"])
+
+    def test_invalid_priority_raises(self) -> None:
+        # bool 虽是 int 子类，但语义上不是合法优先级；float/str/None 同样拒绝。
+        with Scheduler(workers=1, max_pending=4) as s:
+            for bad in (1.5, "1", True, False, None, 0.0):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(InputValidationError):
+                        s.submit("t", lambda: None,
+                                 priority=bad)  # type: ignore[arg-type]
+                    with self.assertRaises(InputValidationError):
+                        s.submit_nowait(
+                            "u", lambda: None,
+                            priority=bad,  # type: ignore[arg-type]
+                        )
+        # 校验失败不留统计痕迹。
+        snap = s.snapshot()
+        self.assertEqual(
+            (snap.accepted, snap.completed, snap.failed, snap.rejected),
+            (0, 0, 0, 0),
+        )
+
+    def test_priority_validated_before_close_check(self) -> None:
+        s = Scheduler(workers=1, max_pending=2)
+        s.close()
+        with self.assertRaises(InputValidationError):
+            s.submit("t", lambda: None, priority=True)
+        with self.assertRaises(SchedulerClosedError):
+            s.submit("t", lambda: None, priority=1)
+
+
 class ConcurrencyTest(unittest.TestCase):
     def test_tasks_run_in_parallel(self) -> None:
         # 2 个工作线程执行 2 个各 0.2 秒的任务，应显著快于串行的 0.4 秒。
