@@ -30,6 +30,9 @@
   已取消/已到期任务不阻塞关闭，已完成/已取消/已到期任务的结果在关闭后
   仍可读取。close 开始时尚在准入队列中等待的调用立即得到
   SchedulerClosedError。
+- stats_checkpoint / snapshot_since 提供区间统计观测：检查点与统计事件
+  记录处于同一原子顺序，snapshot_since 只统计边界之后的事件，字段与
+  分位口径和 snapshot 一致；两者均为只读，关闭后仍可使用。
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ from .errors import (
     SchedulerClosedError,
     TaskCancelledError,
 )
-from .stats import Stats, StatsSnapshot, to_ms
+from .stats import Stats, StatsCheckpoint, StatsSnapshot, to_ms
 
 T = TypeVar("T")
 
@@ -434,6 +437,34 @@ class Scheduler:
     def snapshot(self) -> StatsSnapshot:
         """返回累计统计快照；快照为值拷贝，不随后续任务变化。"""
         return self._stats.snapshot()
+
+    def stats_checkpoint(self) -> StatsCheckpoint:
+        """创建一个统计边界检查点，供 :meth:`snapshot_since` 使用。
+
+        检查点与统计事件记录处于同一原子顺序：在锁序上先于检查点的
+        事件归入边界之前，后于检查点的事件归入边界之后，跨边界事件
+        按该原子裁决只入一侧。检查点不可变、可反复用于查询；调度器
+        关闭后仍可创建检查点并查询历史统计。
+        """
+        return self._stats.checkpoint()
+
+    def snapshot_since(self, checkpoint: StatsCheckpoint) -> StatsSnapshot:
+        """返回自 ``checkpoint`` 边界以来的区间统计快照。
+
+        字段、分位口径与 :meth:`snapshot` 完全一致：计数只含边界之后
+        的事件（accepted/rejected/cancelled/expired 按各自发生时刻、
+        completed/failed 按结束时刻归属，故跨边界任务会在接纳区间计
+        accepted、在结束区间计 completed 或 failed）；queue_wait_ms 与
+        total_latency_ms 只收集边界之后成功或失败结束的任务样本，空
+        区间的计数全为 0、分布值全为 0.0。本方法只读，不改变累计
+        统计，也不影响同一检查点的后续查询。
+
+        :param checkpoint: 必须由本调度器的 :meth:`stats_checkpoint`
+            创建；传入非 StatsCheckpoint、其他调度器的检查点或损坏
+            对象时抛 :class:`InputValidationError`，且不产生任何
+            副作用。
+        """
+        return self._stats.snapshot_since(checkpoint)
 
     def close(self) -> None:
         """关闭调度器。
