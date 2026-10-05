@@ -76,6 +76,19 @@
   单项终态不影响其他任务；`snapshot`、`stats_checkpoint`、
   `snapshot_since`、CLI 输出与退出码，以及 `submit`、`submit_nowait`、
   `submit_with_wait` 的行为均不变。
+- 增量：可选排队优先级老化。`Scheduler` 构造新增 `aging_interval_ms`
+  （缺省 `None` 表示关闭；启用时只接受 >= 1 的整数毫秒，布尔值、零、
+  负数、浮点数或其他类型抛 `InputValidationError`）。启用后，已接纳、
+  尚未被工作线程认领且未进入取消/到期终态的任务，从实际接纳时刻起按
+  单调时钟累计老化周期，派发比较时有效优先级 = 原 `priority` + 已完成
+  周期数；派发顺序为有效优先级降序、原 `priority` 降序、接受先后升序
+  （成组准入任务共享接纳时刻，同级按输入顺序）。工作线程原子认领后有效
+  优先级冻结：老化只改变未开始任务的派发先后，不抢占、不重排执行中
+  任务，也不改变 `max_queue_wait_ms`。未配置老化时派发语义完全不变；
+  四个提交入口的参数位置、返回值、异常、task_id 占用、准入 FIFO、取消、
+  排队到期、执行结果与统计口径不变。CLI 新增 `--aging-interval-ms`
+  （缺省关闭），非法值在标准错误输出 `InputValidationError` 并以退出码
+  2 结束，结果数组与 JSON 结构不变。
 
 ## 约定
 

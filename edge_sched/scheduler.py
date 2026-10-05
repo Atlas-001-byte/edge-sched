@@ -35,6 +35,14 @@
   期间组内全部 task_id 即被占用；超时整组被拒（rejected 加 1），close 时
   未被整组接纳则整组得到 SchedulerClosedError（rejected 不变）——任何
   失败路径都不创建任务、不执行 callable、不改变延迟样本。
+- 可选排队优先级老化：构造参数 aging_interval_ms 缺省 None 表示关闭；
+  启用时只接受 >= 1 的整数毫秒（bool 非法）。开启后，已接纳但尚未被
+  工作线程认领（且未取消、未到期）的任务从实际接纳时刻起按单调时钟
+  累计老化周期，派发比较时有效优先级 = 原 priority + 已完成周期数；
+  派发顺序为有效优先级降序、原 priority 降序、接受先后升序。工作线程
+  原子认领后有效优先级冻结：老化只改变未开始任务的派发先后，不抢占、
+  不重排执行中任务，也不改变 max_queue_wait_ms 的起算与裁决。未配置
+  老化时派发语义与之前完全一致。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
   已取消/已到期任务不阻塞关闭，已完成/已取消/已到期任务的结果在关闭后
   仍可读取。close 开始时尚在准入队列中等待的调用立即得到
@@ -240,12 +248,19 @@ class Scheduler:
     派发顺序：任务按 ``priority`` 降序派发（数值大者先进入工作线程），
     相同优先级按接受先后派发；缺省优先级均为 0，即整体退化为 FCFS。
     优先级只影响已接受但尚未开始执行的任务，不重排执行中或已终态任务。
+    启用 ``aging_interval_ms`` 后，排队中的任务按接纳时刻累计老化周期，
+    派发比较改用有效优先级（原 priority + 已完成周期数），再依次按
+    原 priority 降序、接受先后升序裁决。
 
     :param workers: 工作线程数，必须为 >= 1 的整数。
     :param max_pending: 未完成任务（含排队中与执行中）上限，必须为 >= 1 的整数。
+    :param aging_interval_ms: 可选排队优先级老化周期（毫秒），缺省 None
+        表示关闭（派发语义与不提供该参数完全一致）；启用时只能为 >= 1
+        的整数（bool 非法），否则抛 :class:`InputValidationError`。
     """
 
-    def __init__(self, workers: int, max_pending: int) -> None:
+    def __init__(self, workers: int, max_pending: int,
+                 aging_interval_ms: Optional[int] = None) -> None:
         if not self._is_positive_int(workers):
             raise InputValidationError(
                 "workers must be an integer >= 1, got %r" % (workers,)
@@ -254,8 +269,19 @@ class Scheduler:
             raise InputValidationError(
                 "max_pending must be an integer >= 1, got %r" % (max_pending,)
             )
+        if (aging_interval_ms is not None
+                and not self._is_positive_int(aging_interval_ms)):
+            raise InputValidationError(
+                "aging_interval_ms must be an integer >= 1 or None "
+                "(bool not allowed), got %r" % (aging_interval_ms,)
+            )
         self._workers = workers
         self._max_pending = max_pending
+        # None 表示老化关闭；启用时为老化周期的秒数（单调时钟口径）。
+        self._aging_interval_s: Optional[float] = (
+            None if aging_interval_ms is None
+            else aging_interval_ms / 1000.0
+        )
 
         # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished 的读写。
         self._cond = threading.Condition()
@@ -271,7 +297,9 @@ class Scheduler:
 
         self._stats = Stats()
         # 入站堆：项为 (-priority, 接受序号, 条目)——priority 数值大者先派发，
-        # 同优先级按接受序号小者（先接受）先派发。
+        # 同优先级按接受序号小者（先接受）先派发。启用老化时有效优先级随时间
+        # 变化、无法以静态堆键维护，该列表退化为无序容器，派发选取时按当前
+        # 有效优先级线性扫描（见 _pop_next_locked）。
         self._inbound_cond = threading.Condition()
         self._inbound: list[tuple[int, int, "_TaskEntry"]] = []
         self._accept_seq = 0
@@ -728,9 +756,14 @@ class Scheduler:
         原子可见。
         """
         with self._inbound_cond:
-            heapq.heappush(
-                self._inbound, (-priority, entry.seq, entry)
-            )
+            if self._aging_interval_s is None:
+                heapq.heappush(
+                    self._inbound, (-priority, entry.seq, entry)
+                )
+            else:
+                # 老化开启时入站列表不按堆序维护（选取时线性扫描），
+                # 直接追加即可；元组形态保持一致，供到期扫描复用。
+                self._inbound.append((-priority, entry.seq, entry))
             self._inbound_cond.notify()
 
     def _validate_batch_args(
@@ -996,14 +1029,21 @@ class Scheduler:
         return True
 
     def _prune_cancelled_locked(self) -> None:
-        """丢弃堆顶连续的已结束（取消/到期）惰性令牌；调用时须持有
+        """丢弃已结束（取消/到期）任务的惰性令牌；调用时须持有
         ``_inbound_cond``。
 
-        已结束条目可能埋在未结束条目之下——那种情况下它不影响堆顶选择，
-        留待将来弹到堆顶时再丢弃即可，故只需从堆顶清理。
+        未启用老化（堆结构）：只需从堆顶清理——已结束条目可能埋在未结束
+        条目之下，那种情况下它不影响堆顶选择，留待将来弹到堆顶时再丢弃。
+        启用老化（无序列表）：一次性滤除全部已结束令牌，避免列表只增不减。
         """
-        while self._inbound and self._inbound[0][2].done.is_set():
-            heapq.heappop(self._inbound)
+        if self._aging_interval_s is None:
+            while self._inbound and self._inbound[0][2].done.is_set():
+                heapq.heappop(self._inbound)
+        else:
+            self._inbound[:] = [
+                token for token in self._inbound
+                if not token[2].done.is_set()
+            ]
 
     def _collect_due_locked(self) -> "list[_TaskEntry]":
         """收集堆中已逾认领截止时刻、尚未结束的任务；调用时须持有
@@ -1047,19 +1087,47 @@ class Scheduler:
             return _DISPATCH_POLL
         return min(_DISPATCH_POLL, max(0.0, min(waits)))
 
-    def _pop_next_locked(self) -> "Optional[_TaskEntry]":
-        """弹出并返回当前堆中最高优先级的未结束任务，调用时须持有
-        ``_inbound_cond``。
+    def _dispatch_key(self, entry: "_TaskEntry", now: float
+                      ) -> "tuple[int, int, int]":
+        """老化开启时的派发排序键（小者先派发）。
 
-        等待派发期间已结束（取消/到期）任务的惰性令牌会被依次丢弃
-        （堆顶剪枝之外，弹出的条目也再确认一次 ``done``，以覆盖与
-        取消/到期线程的最后窗口）；堆中没有可派发任务时返回 None。
+        有效优先级 = 原 priority + 自接纳时刻起已完成的老化周期数；
+        依次按有效优先级降序、原 priority 降序、接受序号升序比较。
         """
-        while self._inbound:
-            _, _, entry = heapq.heappop(self._inbound)
-            if not entry.done.is_set():
-                return entry
-        return None
+        assert self._aging_interval_s is not None
+        periods = int((now - entry.submit_time) / self._aging_interval_s)
+        return (-(entry.priority + periods), -entry.priority, entry.seq)
+
+    def _pop_next_locked(self) -> "Optional[_TaskEntry]":
+        """弹出并返回当前应派发的未结束任务，调用时须持有 ``_inbound_cond``。
+
+        未启用老化：弹出堆中最高优先级的未结束任务。启用老化：以当前单调
+        时钟计算各未结束任务的有效优先级，线性选取排序键最小者——有效
+        优先级随等待时间单调上升，静态堆键无法表达，故不在堆上维护。
+
+        等待派发期间已结束（取消/到期）任务的惰性令牌会被依次丢弃（堆顶
+        剪枝之外，弹出的条目也再确认一次 ``done``，以覆盖与取消/到期线程
+        的最后窗口）；堆中没有可派发任务时返回 None。
+        """
+        if self._aging_interval_s is None:
+            while self._inbound:
+                _, _, entry = heapq.heappop(self._inbound)
+                if not entry.done.is_set():
+                    return entry
+            return None
+        now = time.monotonic()
+        best_index = -1
+        best_key: "Optional[tuple[int, int, int]]" = None
+        for index, (_, _, entry) in enumerate(self._inbound):
+            if entry.done.is_set():
+                continue
+            key = self._dispatch_key(entry, now)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_index = index
+        if best_index < 0:
+            return None
+        return self._inbound.pop(best_index)[2]
 
     def _run_dispatcher(self) -> None:
         """事件循环：取得空闲工作线程许可后，按优先级把任务派发到就绪队列。

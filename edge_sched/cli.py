@@ -19,7 +19,12 @@
 以下情况在标准错误打印 ``InputValidationError`` 消息并以退出码 2 结束:
 JSON 非法、字段缺失或类型错误、sleep_ms 不是非负整数、priority 不是整数
 或为布尔值、max_queue_wait_ms 不是 >= 1 的整数或为布尔值、task_id 重复
-或非法、并发参数非法，以及输入文件无法读取。
+或非法、并发参数非法、--aging-interval-ms 不是 >= 1 的整数，以及输入
+文件无法读取。
+
+可选参数 ``--aging-interval-ms``（缺省关闭）启用排队优先级老化：排队
+中的任务每等待一个周期，有效优先级加 1，语义同 Scheduler 构造参数
+``aging_interval_ms``；结果数组与统计 JSON 结构不变。
 """
 
 from __future__ import annotations
@@ -160,6 +165,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-pending", required=True, help="最大未完成任务数（>=1）"
     )
+    parser.add_argument(
+        "--aging-interval-ms", default=None,
+        help="可选排队优先级老化周期（毫秒，>=1；缺省关闭）",
+    )
     return parser
 
 
@@ -170,6 +179,13 @@ def run(argv: "List[str] | None" = None) -> int:
     try:
         workers = _parse_concurrency(args.workers, "--workers")
         max_pending = _parse_concurrency(args.max_pending, "--max-pending")
+        # 缺省（None）表示关闭老化；提供时校验口径与并发参数一致（>=1 整数）。
+        aging_interval_ms = (
+            None if args.aging_interval_ms is None
+            else _parse_concurrency(
+                args.aging_interval_ms, "--aging-interval-ms"
+            )
+        )
         tasks = _load_tasks(args.input)
     except InputValidationError as exc:
         print("InputValidationError: %s" % exc, file=sys.stderr)
@@ -199,7 +215,8 @@ def run(argv: "List[str] | None" = None) -> int:
             gate.release()
 
     threads: List[threading.Thread] = []
-    with Scheduler(workers=workers, max_pending=max_pending) as scheduler:
+    with Scheduler(workers=workers, max_pending=max_pending,
+                   aging_interval_ms=aging_interval_ms) as scheduler:
         for task_id, sleep_ms, priority, max_queue_wait_ms in tasks:
             t = threading.Thread(
                 target=run_one,

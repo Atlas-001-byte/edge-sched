@@ -103,6 +103,23 @@ class CliValidationTest(unittest.TestCase):
     def test_element_not_object(self) -> None:
         self._expect_exit_2([1, 2])
 
+    def test_bad_aging_interval_ms(self) -> None:
+        # 0、负数、浮点数、非数字字符串都以退出码 2 报 InputValidationError。
+        import io
+        from contextlib import redirect_stderr
+
+        path = self._write("tasks.json",
+                           json.dumps([{"task_id": "a", "sleep_ms": 0}]))
+        for bad in ("0", "-5", "1.5", "x", "true"):
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = run(["--input", path, "--workers", "1",
+                                "--max-pending", "1",
+                                "--aging-interval-ms", bad])
+                self.assertEqual(code, 2)
+                self.assertIn("InputValidationError", err.getvalue())
+
 
 class CliSuccessTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -111,7 +128,8 @@ class CliSuccessTest(unittest.TestCase):
         self.dir = self._tmp.name
 
     def _execute(self, tasks: object, workers: int = 4,
-                 max_pending: int = 8) -> dict:
+                 max_pending: int = 8,
+                 extra_args: "list[str] | None" = None) -> dict:
         import io
         from contextlib import redirect_stdout
 
@@ -120,9 +138,11 @@ class CliSuccessTest(unittest.TestCase):
             json.dump(tasks, f)
 
         out = io.StringIO()
+        argv = ["--input", path, "--workers", str(workers),
+                "--max-pending", str(max_pending)]
+        argv.extend(extra_args or [])
         with redirect_stdout(out):
-            code = run(["--input", path, "--workers", str(workers),
-                        "--max-pending", str(max_pending)])
+            code = run(argv)
         self.assertEqual(code, 0)
         return json.loads(out.getvalue())
 
@@ -182,6 +202,27 @@ class CliSuccessTest(unittest.TestCase):
         for r in report["results"]:
             self.assertEqual(set(r), {"task_id", "result"})
         self.assertEqual(report["stats"]["completed"], 3)
+
+    def test_aging_interval_option_keeps_output_shape(self) -> None:
+        # 提供合法 --aging-interval-ms 时正常运行，结果数组与统计结构不变。
+        tasks = [
+            {"task_id": "slow", "sleep_ms": 200},
+            {"task_id": "a", "sleep_ms": 0, "priority": 0},
+            {"task_id": "b", "sleep_ms": 0, "priority": 1},
+        ]
+        report = self._execute(tasks, workers=1, max_pending=3,
+                               extra_args=["--aging-interval-ms", "10"])
+        self.assertEqual(
+            [r["task_id"] for r in report["results"]], ["slow", "a", "b"]
+        )
+        for r in report["results"]:
+            self.assertEqual(set(r), {"task_id", "result"})
+        stats = report["stats"]
+        self.assertEqual(stats["accepted"], 3)
+        self.assertEqual(stats["completed"], 3)
+        self.assertEqual(
+            set(stats["queue_wait_ms"]), {"p50", "p95", "p99", "max"}
+        )
 
     def test_expired_task_result_object_and_stats(self) -> None:
         # 单工作线程被首个长任务占住：带排队时限的第二个任务到期，
