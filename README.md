@@ -52,6 +52,27 @@
   结果读取与 CLI 的输出和异常语义不变。调度器关闭后仍可创建 checkpoint、
   查询历史统计；传入非 `StatsCheckpoint`、其他调度器的 checkpoint 或损坏
   对象时抛 `InputValidationError`，且不改变计数、延迟样本或任务状态。
+- 增量：成组原子准入。新增 `Scheduler.submit_batch_with_wait(tasks,
+  admission_timeout_ms=None)`，`tasks` 为非空列表，每项是含 `task_id`、
+  `fn`、可选 `priority` 与可选 `max_queue_wait_ms` 的字典（字段口径与
+  `submit` 一致，`bool` 非法；任务列表为空或不是列表、元素非字典、
+  缺字段或字段值非法、组内 `task_id` 重复或任务数超过 `max_pending`
+  均抛 `InputValidationError`）。整组与 `submit_with_wait` 按调用先后
+  共用同一条 FIFO 准入队列：只有空缺席位数不少于组内任务数时才在同一
+  原子边界一次性接纳整组，释放名额只考察队首，余量不足即等待，后续单
+  任务或小组不得绕过。接纳时 `accepted` 一次增加组内任务数、全部
+  `max_queue_wait_ms` 同以接纳时刻起算，组内按 `priority` 降序、同级
+  按输入顺序派发。等待期间组内全部 `task_id` 已占用（冲突抛
+  `DuplicateTaskError`）；`admission_timeout_ms` 为 `None` 无限等待、
+  `0` 仅在调用瞬间容纳整组、正整数为毫秒时限，`bool` 或负数抛
+  `InputValidationError`；超时整组抛 `BackpressureError` 且 `rejected`
+  只加 1，`close` 时未接纳抛 `SchedulerClosedError` 且 `rejected` 不变；
+  任何等待期失败都不创建任务、不执行 callable、不改变延迟样本。接纳后
+  按输入顺序返回 `TaskHandle` 元组，不抢占执行中任务，认领前取消抛
+  `TaskCancelledError`、排队到期抛 `QueueTimeoutError` 且 callable 不
+  执行、成功返回原值、失败传播原始异常，单项终态不影响其他任务；
+  `snapshot`、`stats_checkpoint`、`snapshot_since`、CLI 输出与退出码、
+  `submit`/`submit_nowait`/`submit_with_wait` 行为均不变，新失败不改计数。
 
 ## 约定
 

@@ -8,6 +8,10 @@
   :class:`~edge_sched.scheduler.TaskHandle`。
 - :func:`~edge_sched.scheduler.Scheduler.submit_with_wait` -- 容量满时按
   发起先后排队等待名额（可带 admission_timeout_ms），再等待结果。
+- :func:`~edge_sched.scheduler.Scheduler.submit_batch_with_wait` --
+  成组原子准入：整组与单任务调用共用 FIFO 队列，只有空缺席位足以容纳
+  整组时才一次性接纳，按输入顺序返回 TaskHandle 元组（可带
+  admission_timeout_ms）。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
 - :func:`~edge_sched.scheduler.Scheduler.stats_checkpoint` -- 创建区间统计
   观测边界 :class:`~edge_sched.stats.StatsCheckpoint`。
