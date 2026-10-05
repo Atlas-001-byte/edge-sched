@@ -8,6 +8,10 @@
   :class:`~edge_sched.scheduler.TaskHandle`。
 - :func:`~edge_sched.scheduler.Scheduler.submit_with_wait` -- 容量满时按
   发起先后排队等待名额（可带 admission_timeout_ms），再等待结果。
+- :func:`~edge_sched.scheduler.Scheduler.submit_batch_with_wait` --
+  成组原子准入：整组任务要么一次全部获得 max_pending 名额，要么继续在同一条
+  FIFO 准入队列中等待（后续单任务/小组不得绕过），按输入顺序返回
+  :class:`~edge_sched.scheduler.TaskHandle` 元组。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
 - :func:`~edge_sched.scheduler.Scheduler.stats_checkpoint` -- 创建区间统计
   观测边界 :class:`~edge_sched.stats.StatsCheckpoint`。
