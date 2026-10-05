@@ -10,7 +10,11 @@
 布尔值）；priority 数值较大的任务先派发给工作线程，相同数值按文件中的
 接受先后派发。``max_queue_wait_ms`` 为可选排队时限（缺省 None 表示不限；
 只能为 >= 1 的整数，不接受布尔值）：任务被接受后若在时限内未被工作线程
-认领，则不执行对应等待而进入到期终态。每个任务执行一次对应的空等待
+认领，则不执行对应等待而进入到期终态。命令行可选
+``--aging-interval-ms``（缺省关闭）：给定 >= 1 的整数毫秒后，排队中任务
+自接纳时刻起每越过一个老化周期，其派发有效优先级加 1，使长期等待的低
+优先级任务最终获得派发机会；不传该参数时派发语义与之前完全一致。每个
+任务执行一次对应的空等待
 （``time.sleep``），完成后向标准输出打印任务结果（仍按输入顺序）与
 调度器统计快照（JSON）。到期任务的结果对象只含 ``task_id`` 与
 ``error``（固定为 ``"QueueTimeoutError"``），成功对象只含 ``task_id``
@@ -19,7 +23,7 @@
 以下情况在标准错误打印 ``InputValidationError`` 消息并以退出码 2 结束:
 JSON 非法、字段缺失或类型错误、sleep_ms 不是非负整数、priority 不是整数
 或为布尔值、max_queue_wait_ms 不是 >= 1 的整数或为布尔值、task_id 重复
-或非法、并发参数非法，以及输入文件无法读取。
+或非法、并发参数非法、--aging-interval-ms 非法，以及输入文件无法读取。
 """
 
 from __future__ import annotations
@@ -160,6 +164,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-pending", required=True, help="最大未完成任务数（>=1）"
     )
+    # 缺省 None（不传）即关闭老化；值统一经 InputValidationError 口径校验。
+    parser.add_argument(
+        "--aging-interval-ms",
+        default=None,
+        help="排队优先级老化周期毫秒（>=1），缺省关闭老化",
+    )
     return parser
 
 
@@ -170,6 +180,13 @@ def run(argv: "List[str] | None" = None) -> int:
     try:
         workers = _parse_concurrency(args.workers, "--workers")
         max_pending = _parse_concurrency(args.max_pending, "--max-pending")
+        # 缺省未传即 None（关闭老化）；传入时口径与 >= 1 的整数并发参数一致。
+        aging_interval_ms = (
+            None if args.aging_interval_ms is None
+            else _parse_concurrency(
+                args.aging_interval_ms, "--aging-interval-ms"
+            )
+        )
         tasks = _load_tasks(args.input)
     except InputValidationError as exc:
         print("InputValidationError: %s" % exc, file=sys.stderr)
@@ -199,7 +216,11 @@ def run(argv: "List[str] | None" = None) -> int:
             gate.release()
 
     threads: List[threading.Thread] = []
-    with Scheduler(workers=workers, max_pending=max_pending) as scheduler:
+    with Scheduler(
+        workers=workers,
+        max_pending=max_pending,
+        aging_interval_ms=aging_interval_ms,
+    ) as scheduler:
         for task_id, sleep_ms, priority, max_queue_wait_ms in tasks:
             t = threading.Thread(
                 target=run_one,
