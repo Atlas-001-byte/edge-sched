@@ -68,6 +68,13 @@
   oldest_admission_wait_ms 分别从最早未认领任务的接纳时刻、最早等待调用
   的发起时刻算至快照时刻（单调时钟，毫秒保留三位小数，无对象为 0.0，执行
   中任务不计前者）；closing/closed 反映当时状态。既有快照不随后续事件变化。
+- 构造时可选启用滑动延迟窗口（latency_window_tasks，缺省 None 关闭）：
+  启用后按任务结束顺序保留最近 N 个成功/失败结束任务的 queue_wait_ms /
+  total_latency_ms / execution_ms 三元样本（deque(maxlen=N)，三类样本在
+  Stats 同一把锁内同步进出），rolling_snapshot 返回不可变
+  RollingStatsSnapshot（window_size、sampled_finished 与三个分布）。窗口
+  只复用 record_finished 的已记账结束：取消、排队到期、拒绝、close 期间
+  未接纳及执行中任务不入窗；累计与区间统计口径完全不变。
 """
 
 from __future__ import annotations
@@ -87,7 +94,13 @@ from .errors import (
     SchedulerClosedError,
     TaskCancelledError,
 )
-from .stats import Stats, StatsCheckpoint, StatsSnapshot, to_ms
+from .stats import (
+    RollingStatsSnapshot,
+    Stats,
+    StatsCheckpoint,
+    StatsSnapshot,
+    to_ms,
+)
 
 T = TypeVar("T")
 
@@ -413,10 +426,18 @@ class Scheduler:
     :param aging_interval_ms: 可选排队优先级老化周期（毫秒），缺省 None
         表示关闭老化；启用时只接受 >= 1 的整数，布尔值、零、负数、
         浮点数或其他类型均抛 :class:`InputValidationError`。
+    :param latency_window_tasks: 可选滑动延迟窗口容量（任务数），缺省 None
+        表示关闭；启用时只接受 >= 1 的整数（布尔值、零、负数、浮点数或
+        其他类型均抛 :class:`InputValidationError`）。启用后按任务结束顺序
+        保留最近 N 个成功/失败结束任务的 queue_wait_ms / total_latency_ms /
+        execution_ms 三元样本（取消、排队到期、拒绝、关闭期间未接纳及执行中
+        任务不入窗），经 :meth:`rolling_snapshot` 读取。
     """
 
     def __init__(self, workers: int, max_pending: int,
-                 aging_interval_ms: Optional[int] = None) -> None:
+                 aging_interval_ms: Optional[int] = None,
+                 latency_window_tasks: Optional[int] = None) -> None:
+        # 全部参数校验先于任何状态与线程的创建：非法参数不创建调度器。
         if not self._is_positive_int(workers):
             raise InputValidationError(
                 "workers must be an integer >= 1, got %r" % (workers,)
@@ -431,9 +452,16 @@ class Scheduler:
                 "aging_interval_ms must be an integer >= 1 or None "
                 "(bool not allowed), got %r" % (aging_interval_ms,)
             )
+        if (latency_window_tasks is not None
+                and not self._is_positive_int(latency_window_tasks)):
+            raise InputValidationError(
+                "latency_window_tasks must be an integer >= 1 or None "
+                "(bool not allowed), got %r" % (latency_window_tasks,)
+            )
         self._workers = workers
         self._max_pending = max_pending
         self._aging_interval_ms = aging_interval_ms
+        self._latency_window_tasks = latency_window_tasks
 
         # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished 的读写。
         self._cond = threading.Condition()
@@ -452,7 +480,7 @@ class Scheduler:
         # 全部已接受任务的条目长期保留，关闭后结果仍可读取。
         self._tasks: dict[str, _TaskEntry] = {}
 
-        self._stats = Stats()
+        self._stats = Stats(window_size=latency_window_tasks)
         # 入站堆：项为
         # (-有效优先级, -原优先级, 接受序号, 条目)——有效优先级高者先派发
         # （含老化加成），其次原优先级高者，最后接受序号小者（先接受）先
@@ -725,6 +753,23 @@ class Scheduler:
     def snapshot(self) -> StatsSnapshot:
         """返回累计统计快照；快照为值拷贝，不随后续任务变化。"""
         return self._stats.snapshot()
+
+    def rolling_snapshot(self) -> RollingStatsSnapshot:
+        """返回滑动延迟窗口的不可变快照 :class:`RollingStatsSnapshot`。
+
+        构造时以 ``latency_window_tasks`` 启用窗口后，快照按任务结束顺序
+        反映最近 N 个成功/失败结束任务的 queue_wait_ms / total_latency_ms /
+        execution_ms 三元样本：``window_size`` 为配置容量 N，
+        ``sampled_finished`` 为窗内结束任务数（窗口未满时等于启用后结束
+        任务总数，满窗后等于 N），三个分布沿用累计统计的键、
+        ``ceil(n*q)`` 分位口径与三位小数，空窗四个值均为 0.0。取样与
+        :meth:`snapshot` / :meth:`snapshot_since` 的既有记账处于同一原子
+        顺序，窗内只含已记账的成功/失败结束任务；取消、排队到期、拒绝、
+        close 期间未接纳及执行中任务都不入窗。快照为值拷贝，重复读取稳定、
+        互不影响，调度器关闭后仍可读。未启用窗口时返回 ``window_size=0``、
+        ``sampled_finished=0`` 与三个空分布。
+        """
+        return self._stats.rolling_snapshot()
 
     def runtime_snapshot(self) -> RuntimeSnapshot:
         """返回当前调度器状态的不可变即时观测 :class:`RuntimeSnapshot`。

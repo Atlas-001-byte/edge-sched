@@ -1,8 +1,9 @@
 """Stats / percentile 的单元测试。"""
 
+import json
 import unittest
 
-from edge_sched.stats import Stats, StatsCheckpoint, percentile
+from edge_sched.stats import RollingStatsSnapshot, Stats, StatsCheckpoint, percentile
 
 
 class PercentileTest(unittest.TestCase):
@@ -304,6 +305,133 @@ class StatsCheckpointTest(unittest.TestCase):
         # 失败校验不改变任何状态。
         self.assertEqual(owner.snapshot().accepted, 0)
         self.assertEqual(other.snapshot().accepted, 0)
+
+
+class RollingStatsTest(unittest.TestCase):
+    def test_disabled_window_is_empty(self) -> None:
+        stats = Stats()
+        stats.record_accepted()
+        stats.record_finished(1.0, 2.0, 1.0, success=True)
+        snap = stats.rolling_snapshot()
+        self.assertIsInstance(snap, RollingStatsSnapshot)
+        self.assertEqual(snap.window_size, 0)
+        self.assertEqual(snap.sampled_finished, 0)
+        self.assertEqual(snap.queue_wait_ms, _EMPTY_DIST)
+        self.assertEqual(snap.total_latency_ms, _EMPTY_DIST)
+        self.assertEqual(snap.execution_ms, _EMPTY_DIST)
+        # 未启用窗口不影响累计统计。
+        self.assertEqual(stats.snapshot().completed, 1)
+
+    def test_partial_then_full_window(self) -> None:
+        stats = Stats(window_size=3)
+        stats.record_finished(1.0, 10.0, 9.0, success=True)
+        stats.record_finished(2.0, 20.0, 18.0, success=False)
+        partial = stats.rolling_snapshot()
+        # 窗口未满：sampled_finished 等于启用后结束任务总数。
+        self.assertEqual(partial.window_size, 3)
+        self.assertEqual(partial.sampled_finished, 2)
+        self.assertEqual(partial.queue_wait_ms["max"], 2.0)
+        self.assertEqual(partial.total_latency_ms["max"], 20.0)
+        self.assertEqual(partial.execution_ms["max"], 18.0)
+
+        stats.record_finished(3.0, 30.0, 27.0, success=True)
+        full = stats.rolling_snapshot()
+        self.assertEqual(full.sampled_finished, 3)
+        self.assertEqual(full.queue_wait_ms["max"], 3.0)
+        self.assertEqual(full.execution_ms["max"], 27.0)
+
+    def test_window_evicts_oldest_and_keeps_finish_order(self) -> None:
+        stats = Stats(window_size=2)
+        stats.record_finished(1.0, 10.0, 1.0, success=True)
+        stats.record_finished(2.0, 20.0, 2.0, success=True)
+        stats.record_finished(3.0, 30.0, 3.0, success=True)
+        stats.record_finished(4.0, 40.0, 4.0, success=False)
+        snap = stats.rolling_snapshot()
+        self.assertEqual(snap.window_size, 2)
+        self.assertEqual(snap.sampled_finished, 2)
+        # 仅保留最近两个结束任务（3、4）：三类样本同步进出。
+        self.assertEqual(snap.queue_wait_ms,
+                         {"p50": 3.0, "p95": 4.0, "p99": 4.0, "max": 4.0})
+        self.assertEqual(snap.total_latency_ms,
+                         {"p50": 30.0, "p95": 40.0, "p99": 40.0, "max": 40.0})
+        self.assertEqual(snap.execution_ms,
+                         {"p50": 3.0, "p95": 4.0, "p99": 4.0, "max": 4.0})
+        # 累计统计不受窗口剔除影响。
+        self.assertEqual(stats.snapshot().completed, 3)
+        self.assertEqual(stats.snapshot().failed, 1)
+
+    def test_cancelled_expired_rejected_never_enter_window(self) -> None:
+        stats = Stats(window_size=5)
+        stats.record_accepted()
+        stats.record_cancelled()
+        stats.record_accepted()
+        stats.record_expired()
+        stats.record_rejected()
+        snap = stats.rolling_snapshot()
+        self.assertEqual(snap.sampled_finished, 0)
+        self.assertEqual(snap.execution_ms, _EMPTY_DIST)
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
+        self.assertEqual(stats.rolling_snapshot().sampled_finished, 1)
+
+    def test_distribution_uses_same_percentile_rule(self) -> None:
+        stats = Stats(window_size=20)
+        for i in range(1, 21):
+            stats.record_finished(float(i), float(i), float(i), success=True)
+        snap = stats.rolling_snapshot()
+        self.assertEqual(snap.sampled_finished, 20)
+        # ceil(n*q)：p50=10、p95=19、p99=20，与累计口径一致。
+        self.assertEqual(snap.queue_wait_ms["p50"], 10.0)
+        self.assertEqual(snap.queue_wait_ms["p95"], 19.0)
+        self.assertEqual(snap.queue_wait_ms["p99"], 20.0)
+
+    def test_three_decimals_and_empty_are_zero(self) -> None:
+        stats = Stats(window_size=3)
+        stats.record_finished(0.1236, 0.9994, 0.8758, success=True)
+        snap = stats.rolling_snapshot()
+        self.assertEqual(snap.queue_wait_ms["max"], 0.124)
+        self.assertEqual(snap.total_latency_ms["max"], 0.999)
+        self.assertEqual(snap.execution_ms["max"], 0.876)
+        empty = Stats(window_size=2).rolling_snapshot()
+        self.assertEqual(empty.queue_wait_ms, _EMPTY_DIST)
+
+    def test_snapshot_is_value_copy_and_stable(self) -> None:
+        stats = Stats(window_size=2)
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
+        first = stats.rolling_snapshot()
+        stats.record_finished(2.0, 2.0, 2.0, success=True)
+        stats.record_finished(3.0, 3.0, 3.0, success=True)
+        # 早先快照不随后续事件变化。
+        self.assertEqual(first.sampled_finished, 1)
+        self.assertEqual(first.queue_wait_ms["max"], 1.0)
+        again = stats.rolling_snapshot()
+        self.assertEqual(again.sampled_finished, 2)
+        self.assertEqual(stats.rolling_snapshot().to_dict(), again.to_dict())
+
+    def test_to_dict_shape_and_json(self) -> None:
+        stats = Stats(window_size=2)
+        stats.record_finished(1.0, 2.0, 1.0, success=True)
+        d = stats.rolling_snapshot().to_dict()
+        self.assertEqual(set(d), {
+            "window_size", "sampled_finished",
+            "queue_wait_ms", "total_latency_ms", "execution_ms",
+        })
+        self.assertEqual(d["window_size"], 2)
+        self.assertEqual(d["sampled_finished"], 1)
+        encoded = json.dumps(d)
+        self.assertEqual(json.loads(encoded), d)
+        # 返回的字典是拷贝。
+        d["sampled_finished"] = 99
+        self.assertEqual(stats.rolling_snapshot().sampled_finished, 1)
+
+    def test_snapshot_is_immutable(self) -> None:
+        snap = Stats(window_size=2).rolling_snapshot()
+        for name in ("window_size", "sampled_finished",
+                     "queue_wait_ms", "new_attr"):
+            with self.subTest(name=name):
+                with self.assertRaises(AttributeError):
+                    setattr(snap, name, 1)
+                with self.assertRaises(AttributeError):
+                    delattr(snap, name)
 
 
 if __name__ == "__main__":

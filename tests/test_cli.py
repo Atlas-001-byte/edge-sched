@@ -103,6 +103,27 @@ class CliValidationTest(unittest.TestCase):
     def test_element_not_object(self) -> None:
         self._expect_exit_2([1, 2])
 
+    def test_bad_latency_window_tasks(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        good = [{"task_id": "a", "sleep_ms": 0}]
+        for bad in ("0", "-3", "1.5", "x"):
+            path = self._write(
+                "tasks_%s.json" % bad.replace("-", "n").replace(".", "p"),
+                json.dumps(good),
+            )
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = run(["--input", path, "--workers", "1",
+                            "--max-pending", "1",
+                            "--latency-window-tasks", bad])
+            self.assertEqual(code, 2, bad)
+            self.assertTrue(
+                err.getvalue().strip().startswith("InputValidationError:"),
+                err.getvalue(),
+            )
+
 
 class CliSuccessTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -111,7 +132,8 @@ class CliSuccessTest(unittest.TestCase):
         self.dir = self._tmp.name
 
     def _execute(self, tasks: object, workers: int = 4,
-                 max_pending: int = 8) -> dict:
+                 max_pending: int = 8,
+                 extra: "list[str] | None" = None) -> dict:
         import io
         from contextlib import redirect_stdout
 
@@ -119,10 +141,13 @@ class CliSuccessTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(tasks, f)
 
+        argv = ["--input", path, "--workers", str(workers),
+                "--max-pending", str(max_pending)]
+        if extra:
+            argv.extend(extra)
         out = io.StringIO()
         with redirect_stdout(out):
-            code = run(["--input", path, "--workers", str(workers),
-                        "--max-pending", str(max_pending)])
+            code = run(argv)
         self.assertEqual(code, 0)
         return json.loads(out.getvalue())
 
@@ -233,6 +258,54 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(set(stats["execution_ms"]),
                          {"p50", "p95", "p99", "max"})
         self.assertGreaterEqual(stats["execution_ms"]["max"], 300.0)
+
+    def test_no_rolling_key_when_disabled(self) -> None:
+        report = self._execute([{"task_id": "a", "sleep_ms": 0}])
+        self.assertNotIn("rolling", report["stats"])
+
+    def test_rolling_present_when_enabled(self) -> None:
+        tasks = [{"task_id": "t%d" % i, "sleep_ms": 0} for i in range(5)]
+        report = self._execute(
+            tasks, workers=2, max_pending=5,
+            extra=["--latency-window-tasks", "3"],
+        )
+        rolling = report["stats"]["rolling"]
+        # rolling 等于 RollingStatsSnapshot.to_dict() 的固定五字段。
+        self.assertEqual(set(rolling), {
+            "window_size", "sampled_finished",
+            "queue_wait_ms", "total_latency_ms", "execution_ms",
+        })
+        self.assertEqual(rolling["window_size"], 3)
+        # 5 个任务全部结束，窗口容量 3：窗内只保留最近 3 个结束任务。
+        self.assertEqual(rolling["sampled_finished"], 3)
+        for group in ("queue_wait_ms", "total_latency_ms", "execution_ms"):
+            self.assertEqual(
+                set(rolling[group]), {"p50", "p95", "p99", "max"}
+            )
+
+    def test_rolling_window_larger_than_task_count(self) -> None:
+        tasks = [{"task_id": "t%d" % i, "sleep_ms": 0} for i in range(2)]
+        report = self._execute(
+            tasks, workers=2, max_pending=2,
+            extra=["--latency-window-tasks", "10"],
+        )
+        rolling = report["stats"]["rolling"]
+        self.assertEqual(rolling["window_size"], 10)
+        # 窗口未满：sampled_finished 等于结束任务总数。
+        self.assertEqual(rolling["sampled_finished"], 2)
+
+    def test_rolling_empty_for_empty_input(self) -> None:
+        report = self._execute(
+            [], extra=["--latency-window-tasks", "4"]
+        )
+        rolling = report["stats"]["rolling"]
+        self.assertEqual(rolling["window_size"], 4)
+        self.assertEqual(rolling["sampled_finished"], 0)
+        for group in ("queue_wait_ms", "total_latency_ms", "execution_ms"):
+            self.assertEqual(
+                rolling[group],
+                {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
+            )
 
 
 class CliModuleTest(unittest.TestCase):

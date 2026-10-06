@@ -13,7 +13,12 @@
 认领，则不执行对应等待而进入到期终态。命令行可选
 ``--aging-interval-ms``（缺省关闭）：给定 >= 1 的整数毫秒后，排队中任务
 自接纳时刻起每越过一个老化周期，其派发有效优先级加 1，使长期等待的低
-优先级任务最终获得派发机会；不传该参数时派发语义与之前完全一致。每个
+优先级任务最终获得派发机会；不传该参数时派发语义与之前完全一致。命令行
+另可选 ``--latency-window-tasks``（缺省关闭）：给定 >= 1 的整数任务数 N
+后，调度器额外按任务结束顺序保留最近 N 个结束任务的
+queue_wait_ms / total_latency_ms / execution_ms 三元样本，最终 stats
+中新增 ``rolling`` 对象（形态为 RollingStatsSnapshot.to_dict()）；不传
+该参数时 stats 不含 ``rolling``，输出结构与之前完全一致。每个
 任务执行一次对应的空等待
 （``time.sleep``），完成后向标准输出打印任务结果（仍按输入顺序）与
 调度器统计快照（JSON）。快照在既有 ``queue_wait_ms`` /
@@ -26,7 +31,8 @@
 以下情况在标准错误打印 ``InputValidationError`` 消息并以退出码 2 结束:
 JSON 非法、字段缺失或类型错误、sleep_ms 不是非负整数、priority 不是整数
 或为布尔值、max_queue_wait_ms 不是 >= 1 的整数或为布尔值、task_id 重复
-或非法、并发参数非法、--aging-interval-ms 非法，以及输入文件无法读取。
+或非法、并发参数非法、--aging-interval-ms 非法、
+--latency-window-tasks 非法，以及输入文件无法读取。
 """
 
 from __future__ import annotations
@@ -173,6 +179,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="排队优先级老化周期毫秒（>=1），缺省关闭老化",
     )
+    # 缺省 None（不传）即关闭滑动延迟窗口；值口径与 >= 1 的整数并发参数一致。
+    parser.add_argument(
+        "--latency-window-tasks",
+        default=None,
+        help="滑动延迟窗口容量（最近 N 个结束任务，>=1），缺省关闭",
+    )
     return parser
 
 
@@ -188,6 +200,13 @@ def run(argv: "List[str] | None" = None) -> int:
             None if args.aging_interval_ms is None
             else _parse_concurrency(
                 args.aging_interval_ms, "--aging-interval-ms"
+            )
+        )
+        # 缺省未传即 None（关闭滑动延迟窗口）；传入时同样要求 >= 1 的整数。
+        latency_window_tasks = (
+            None if args.latency_window_tasks is None
+            else _parse_concurrency(
+                args.latency_window_tasks, "--latency-window-tasks"
             )
         )
         tasks = _load_tasks(args.input)
@@ -223,6 +242,7 @@ def run(argv: "List[str] | None" = None) -> int:
         workers=workers,
         max_pending=max_pending,
         aging_interval_ms=aging_interval_ms,
+        latency_window_tasks=latency_window_tasks,
     ) as scheduler:
         for task_id, sleep_ms, priority, max_queue_wait_ms in tasks:
             t = threading.Thread(
@@ -236,13 +256,21 @@ def run(argv: "List[str] | None" = None) -> int:
             t.join()
 
         snapshot = scheduler.snapshot()
+        # 仅在启用滑动窗口时输出 rolling；未启用时输出结构与之前完全一致。
+        rolling = (
+            scheduler.rolling_snapshot().to_dict()
+            if latency_window_tasks is not None else None
+        )
 
+    stats = snapshot.to_dict()
+    if rolling is not None:
+        stats["rolling"] = rolling
     output = {
         "results": [
             _result_object(task_id, results[task_id])
             for task_id, _, _, _ in tasks
         ],
-        "stats": snapshot.to_dict(),
+        "stats": stats,
     }
     json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")

@@ -133,6 +133,31 @@
   快照仍一致；close 后无 queued/running/admission_waiters，
   `closing`/`closed` 反映当时状态，已返回的快照不随后续事件变化。现有
   公开 API、统计、异常与 CLI 不变，且不产生任何落盘文件。
+- 增量：滑动窗口延迟观测。`Scheduler` 构造在 `aging_interval_ms` 之后新增
+  `latency_window_tasks`（缺省 `None` 关闭）；启用值只能是 >= 1 的整数
+  任务数，布尔值、零、负数、浮点数或其他类型抛 `InputValidationError`，
+  且不创建调度器（参数校验先于任何状态与线程创建）。启用后按任务**结束
+  顺序**保留最近 N 个成功/失败结束任务的 `queue_wait_ms` /
+  `total_latency_ms` / `execution_ms` 三元样本（`deque(maxlen=N)`，三类
+  样本在统计同一把锁内同步进出）；取消、排队到期、拒绝、close 期间未
+  接纳及执行中任务不入窗。累计统计与区间统计（`stats_checkpoint` /
+  `snapshot_since`）的口径、分位定义与 `to_dict` 形态完全不变，窗口只在
+  `record_finished` 的同一原子顺序上额外记账。从 `edge_sched` 导出不可变
+  `RollingStatsSnapshot`，`Scheduler.rolling_snapshot()` 返回它：固定字段
+  为 `window_size`、`sampled_finished`、`queue_wait_ms`、
+  `total_latency_ms`、`execution_ms`；三个分布沿用既有键、`ceil(n*q)`
+  分位与三位小数，空分布四个值均为 0.0。`sampled_finished` 为窗内结束
+  任务数，窗口未满时等于启用后结束任务总数，满窗后等于 N。取样与既有
+  统计记账同序、只含已记账结束，`rolling_snapshot` 与 `snapshot` /
+  `snapshot_since` 同刻边界一致；快照为值拷贝，对象不可修改或删除，
+  `to_dict()` 只含上述字段且可 JSON 序列化，重复读取稳定，close 后窗口
+  仍可读。未启用时 `rolling_snapshot()` 返回 `window_size=0`、
+  `sampled_finished=0` 与三个空分布。四个提交入口、准入 FIFO、老化、
+  取消、到期、背压、关闭、执行结果与其余公开输出均不变。CLI 新增
+  `--latency-window-tasks`（缺省关闭，输出不含 `rolling`）；启用后最终
+  stats 新增 `rolling`，其值等于 `RollingStatsSnapshot.to_dict()`，结果
+  数组与既有 stats 字段、退出码与输入顺序输出不变；非法值在标准错误
+  打印 `InputValidationError` 并以退出码 2 结束，不落盘。
 
 ## 约定
 
