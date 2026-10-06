@@ -158,6 +158,25 @@
   stats 新增 `rolling`，其值等于 `RollingStatsSnapshot.to_dict()`，结果
   数组与既有 stats 字段、退出码与输入顺序输出不变；非法值在标准错误
   打印 `InputValidationError` 并以退出码 2 结束，不落盘。
+- 增量：运行时工作线程容量调整。新增 `Scheduler.resize_workers(workers)`：
+  `workers` 只能是 >= 1 的整数，布尔值、0、负数、浮点数或其他类型抛
+  `InputValidationError`；相同容量调用是无操作并正常返回。目标值在
+  `_cond` 状态锁内原子生效，与提交、认领、取消、到期、名额释放及
+  `close` 并发安全；并发调整按取得锁的先后串行，后一次覆盖前一次。
+  扩容先补足新工作线程再补充许可，新增线程立即可接收任务；缩容把并发
+  上限立即降到目标值——空闲许可当场退出流通，被占用的许可记为退役
+  额度随归还逐步吸收，等量工作线程在取到停止哨兵后退出——但不打断、
+  不取消、不提前结束已认领执行中的 callable（仍按原值或原异常结束），
+  任务结束后不再按旧上限启动新任务；未认领任务继续排队，仍按
+  priority 降序、同级接受先后及 aging 语义派发。容量变化不改变
+  `max_pending`、准入 FIFO、成组原子性、排队时限、取消、到期、背压、
+  task_id 占用与释放、结果读取和 `close` 语义；`runtime_snapshot().workers`
+  与 `RuntimeSnapshot.to_dict()` 的 `workers` 报告当前有效目标容量，
+  已返回快照不随后续调整变化，其余快照字段与统计口径不变。调度器
+  closing 或 closed 时调用抛 `SchedulerClosedError`，容量与任务状态
+  不变；若调整先于 `close` 取得状态锁，则按新容量收尾，`close` 仍等待
+  全部已接受任务结束并安全停止所有线程。`python -m edge_sched` 与现有
+  CLI 参数、输出、退出码不变，不新增落盘行为。
 
 ## 约定
 

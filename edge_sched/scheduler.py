@@ -75,6 +75,20 @@
   RollingStatsSnapshot（window_size、sampled_finished 与三个分布）。窗口
   只复用 record_finished 的已记账结束：取消、排队到期、拒绝、close 期间
   未接纳及执行中任务不入窗；累计与区间统计口径完全不变。
+- resize_workers 在运行时调整工作线程容量（目标并发执行数）：只接受
+  >= 1 的整数（布尔值、零、负数、浮点数或其他类型抛
+  InputValidationError）；相同容量调用是无操作并正常返回。目标值在
+  _cond 状态锁内原子生效，与提交、认领、取消、到期、名额释放及 close
+  并发安全；并发调整按取得锁的先后串行，后一次覆盖前一次。扩容先补足
+  新工作线程再补充许可，新增线程立即可接收任务；缩容把并发上限立即
+  降到目标值——空闲许可当场退出流通，被占用的许可记为退役额度，随
+  任务结束（或认领时发现已取消/到期）的归还逐步吸收，同时等量工作
+  线程在取到停止哨兵后退出。已认领执行中的 callable 不打断、不取消、
+  不提前结束，仍按原值或原异常结束；未认领任务继续排队，仍按现有
+  priority 降序、同级接受先后及 aging 语义派发。容量变化不改变
+  max_pending、准入 FIFO、成组原子性、排队时限、取消、到期、背压、
+  task_id 占用与释放、结果读取和 close 语义；closing 或 closed 时调用
+  抛 SchedulerClosedError，容量与任务状态不变。
 """
 
 from __future__ import annotations
@@ -322,7 +336,8 @@ class RuntimeSnapshot:
 
     固定字段:
 
-    - ``workers``：工作线程数（构造参数）。
+    - ``workers``：当前有效的工作线程目标容量（构造参数，可经
+      :meth:`Scheduler.resize_workers` 运行时调整；快照时刻的值）。
     - ``max_pending``：未完成任务上限（构造参数）。
     - ``queued``：已接纳、尚未被工作线程认领且仍可执行的任务数；被取消、
       到期或已结束的任务不计，执行中的任务不计。
@@ -421,7 +436,8 @@ class Scheduler:
     增加 1；派发依次按有效优先级降序、原 priority 降序、接受先后升序。
     老化不抢占、不重排执行中任务，原子认领后有效优先级冻结。
 
-    :param workers: 工作线程数，必须为 >= 1 的整数。
+    :param workers: 初始工作线程数，必须为 >= 1 的整数；运行时可经
+        :meth:`resize_workers` 调整目标容量。
     :param max_pending: 未完成任务（含排队中与执行中）上限，必须为 >= 1 的整数。
     :param aging_interval_ms: 可选排队优先级老化周期（毫秒），缺省 None
         表示关闭老化；启用时只接受 >= 1 的整数，布尔值、零、负数、
@@ -462,6 +478,8 @@ class Scheduler:
         self._max_pending = max_pending
         self._aging_interval_ms = aging_interval_ms
         self._latency_window_tasks = latency_window_tasks
+        # 缩容挂起的退役许可数：随许可归还逐步吸收，使并发上限降到目标值。
+        self._retire_permits = 0
 
         # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished 的读写。
         self._cond = threading.Condition()
@@ -490,12 +508,18 @@ class Scheduler:
         self._accept_seq = 0
         self._ready: "queue.Queue[Any]" = queue.Queue()
         # 空闲工作线程许可：事件循环派发前必须先取得一个许可。
-        self._worker_slots = threading.BoundedSemaphore(workers)
+        # 用普通 Semaphore 以支持 resize_workers 扩容时补充许可；
+        # 缩容则通过立即取走空闲许可与 _retire_permits 退役额度降低流通量。
+        self._worker_slots = threading.Semaphore(workers)
         self._stop_dispatcher = threading.Event()
 
         self._dispatcher = threading.Thread(
             target=self._run_dispatcher, name="edge-sched-loop", daemon=True
         )
+        # 工作线程命名序号单调递增：resize_workers 扩容追加的线程不与既有
+        # 线程重名；_worker_threads 记录所有已启动线程（含已退出的），
+        # close 时逐一 join。
+        self._worker_seq = workers
         self._worker_threads = [
             threading.Thread(
                 target=self._run_worker,
@@ -863,6 +887,45 @@ class Scheduler:
         except ValueError as exc:
             raise InputValidationError(str(exc)) from None
 
+    def resize_workers(self, workers: int) -> None:
+        """运行时调整工作线程容量（目标并发执行数）。
+
+        - ``workers`` 只能是 >= 1 的整数；布尔值、0、负数、浮点数或其他
+          类型抛 :class:`InputValidationError`，容量与任务状态不变。
+        - 与当前容量相同：无操作，正常返回。
+        - 扩容：先补足新工作线程再补充许可，新增线程立即可接收任务。
+        - 缩容：并发上限立即降到目标值——空闲许可当场退出流通，被
+          执行中任务占用的许可记为退役额度，随许可归还逐步吸收；等量
+          工作线程在取到停止哨兵后退出。已认领执行中的 callable 不打断、
+          不取消、不提前结束，仍按原值或原异常结束；但任务结束后不得
+          再按旧上限启动新任务。扩回容量时同样先补足工作线程后再派发。
+
+        未认领任务继续排队，仍按 priority 降序、同级接受先后及 aging
+        语义派发；max_pending、准入 FIFO、成组原子性、排队时限、取消、
+        到期、背压、task_id 占用与释放、结果读取和 close 语义均不变。
+
+        目标值在 ``_cond`` 状态锁内原子生效，与提交、认领、取消、到期、
+        名额释放及 close 并发安全；并发调整按取得锁的先后串行，后一次
+        覆盖前一次。调度器 closing 或 closed 时抛
+        :class:`SchedulerClosedError`，容量与任务状态不变。
+        """
+        if not self._is_positive_int(workers):
+            raise InputValidationError(
+                "workers must be an integer >= 1, got %r" % (workers,)
+            )
+        with self._cond:
+            if self._closing:
+                raise SchedulerClosedError("scheduler is closed")
+            delta = workers - self._workers
+            if delta == 0:
+                # 相同容量：无操作。
+                return
+            self._workers = workers
+            if delta > 0:
+                self._grow_workers_locked(delta)
+            else:
+                self._shrink_workers_locked(-delta)
+
     def close(self) -> None:
         """关闭调度器。
 
@@ -906,9 +969,12 @@ class Scheduler:
             self._inbound_cond.notify_all()
         self._dispatcher.join()
 
-        # 每个工作线程一个停止哨兵。
+        # 每个工作线程一个停止哨兵。self._workers 是 resize 后的目标容量，
+        # 恒等于应存活的工作线程数（缩容哨兵已按差值先行入队）；closing
+        # 后 resize_workers 不再改变它，此处读到的是最终值。
         for _ in range(self._workers):
             self._ready.put(_SENTINEL)
+        # _worker_threads 含 resize 扩容追加的全部线程；已退出者 join 立即返回。
         for t in self._worker_threads:
             t.join()
 
@@ -1292,6 +1358,57 @@ class Scheduler:
         entry.done.set()
         return True
 
+    def _grow_workers_locked(self, count: int) -> None:
+        """扩容 ``count`` 个工作线程容量；调用时须持有 ``_cond``。
+
+        先用尚未吸收的缩容退役额度抵消部分增量（对应的许可仍在流通，
+        无需重复补充），再启动新工作线程并释放差额许可。线程先于许可
+        就位，保证许可可用、事件循环派发时已有线程能立即接收任务。
+        """
+        absorb = min(self._retire_permits, count)
+        self._retire_permits -= absorb
+        for _ in range(count):
+            thread = threading.Thread(
+                target=self._run_worker,
+                name="edge-sched-worker-%d" % self._worker_seq,
+                daemon=True,
+            )
+            self._worker_seq += 1
+            self._worker_threads.append(thread)
+            thread.start()
+        for _ in range(count - absorb):
+            self._worker_slots.release()
+
+    def _shrink_workers_locked(self, count: int) -> None:
+        """缩容 ``count`` 个工作线程容量；调用时须持有 ``_cond``。
+
+        能立即取得的空闲许可当场退出流通（非阻塞获取，不在锁内等待）；
+        被执行中任务占用的部分记为退役额度，由 :meth:`_release_worker_slot`
+        在随后归还时吸收——并发上限由此立即降到目标值，已认领任务照常
+        执行到底，只是结束后不再按旧上限补位。同时向就绪队列放入等量
+        停止哨兵，对应数量的工作线程在再次取任务时退出。
+        """
+        remaining = count
+        while remaining > 0 and self._worker_slots.acquire(blocking=False):
+            remaining -= 1
+        self._retire_permits += remaining
+        for _ in range(count):
+            self._ready.put(_SENTINEL)
+
+    def _release_worker_slot(self) -> None:
+        """归还一个工作线程许可；存在缩容退役额度时由本次归还吸收。
+
+        缩容把“未能立即退出流通”的许可记为退役额度：此后每次许可归还
+        （任务结束、认领时发现已取消/到期、事件循环空取）优先抵消退役
+        额度而不再回到许可池，直到额度清零——执行中任务不被打断，但
+        结束后不会再按旧上限启动新任务。
+        """
+        with self._cond:
+            if self._retire_permits > 0:
+                self._retire_permits -= 1
+                return
+        self._worker_slots.release()
+
     def _prune_cancelled_locked(self) -> None:
         """丢弃堆顶连续的已结束（取消/到期）惰性令牌；调用时须持有
         ``_inbound_cond``。
@@ -1444,7 +1561,7 @@ class Scheduler:
                 # 总会按当前时刻重排堆，等待期间越过的老化边界不会丢失。
                 continue
             if self._stop_dispatcher.is_set():
-                self._worker_slots.release()
+                self._release_worker_slot()
                 return
             with self._inbound_cond:
                 due = self._collect_due_locked()
@@ -1455,7 +1572,7 @@ class Scheduler:
                 entry = self._pop_next_locked()
             if entry is None:
                 # 等待许可期间堆中的任务已全部被取消/到期：归还许可继续循环。
-                self._worker_slots.release()
+                self._release_worker_slot()
                 continue
             self._ready.put(entry)
 
@@ -1474,7 +1591,7 @@ class Scheduler:
             start_time = 0.0
             with self._cond:
                 if entry.cancelled or entry.expired:
-                    self._worker_slots.release()
+                    self._release_worker_slot()
                     continue
                 if (entry.deadline is not None
                         and time.monotonic() >= entry.deadline):
@@ -1491,7 +1608,7 @@ class Scheduler:
                     start_time = time.monotonic()
             if expired:
                 entry.done.set()
-                self._worker_slots.release()
+                self._release_worker_slot()
                 continue
 
             try:
@@ -1524,8 +1641,9 @@ class Scheduler:
                 self._cond.notify_all()
             entry.done.set()
 
-            # 执行结束才释放许可，许可数即并发执行数。
-            self._worker_slots.release()
+            # 执行结束才释放许可，许可数即并发执行数；缩容退役额度
+            # 可能吸收本次归还，使并发上限降到目标值。
+            self._release_worker_slot()
 
     # ------------------------------------------------------------- context mgr
 

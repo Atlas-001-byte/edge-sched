@@ -26,6 +26,10 @@
   （window_size/sampled_finished 与 queue_wait_ms、total_latency_ms、
   execution_ms 三个最近任务分布）；构造时以 latency_window_tasks 启用，
   未启用时窗口容量与样本数均为 0。
+- :func:`~edge_sched.scheduler.Scheduler.resize_workers` -- 运行时调整
+  工作线程容量（>= 1 的整数）：扩容先补足线程再补充许可，缩容立即降低
+  并发上限但不打断执行中任务；``runtime_snapshot().workers`` 报告当前
+  有效目标容量。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
   :class:`~edge_sched.errors.InputValidationError` /
