@@ -94,6 +94,25 @@
   `to_dict` 形态不变。CLI 新增 `--aging-interval-ms`（缺省关闭），原有
   调用方式、结果数组与 JSON 结构不变；非法值在标准错误打印
   `InputValidationError` 并以退出码 2 结束。
+- 增量：执行耗时分布。`StatsSnapshot.to_dict()` 在既有计数与
+  `queue_wait_ms`、`total_latency_ms` 之外新增同形态（p50/p95/p99/max，
+  毫秒保留三位小数，空分布四个值均为 0.0）的 `execution_ms`，
+  `StatsSnapshot` 同时暴露 `execution_ms` 属性。计时从任务被工作线程
+  在锁内原子认领（置 `started`）之后开始，到 callable 正常返回或抛出
+  `Exception` 为止，因此既不含认领前的排队等待，也不含结束后的记账/
+  唤醒开销；成功任务与失败任务都恰好贡献一个执行耗时样本，失败时
+  `TaskHandle.result` / `Scheduler.result` 仍原样抛出 callable 的异常。
+  未开始执行就被取消（`TaskCancelledError`）或排队到期
+  （`QueueTimeoutError`）的任务不贡献 `execution_ms`，提交被拒、参数
+  校验失败、关闭期间未接纳的任务同样不贡献。`stats_checkpoint` /
+  `snapshot_since` 按任务结束时刻把执行耗时样本归属到对应区间：跨
+  checkpoint 的任务仍在接纳区间计 `accepted`，在结束区间计
+  `completed`/`failed` 并贡献执行样本；分位计算只使用当前快照或当前
+  区间内的样本，同一 checkpoint 反复查询结果稳定。
+  `python -m edge_sched` 的结果数组、逐项结果对象、退出码与既有 stats
+  字段保持不变，只在 stats 中新增 `execution_ms`；提交、返回、取消、
+  到期、背压、task_id 占用、结果读取、关闭语义、输入校验与优先级派发
+  顺序均不变，也不另建落盘文件。
 
 ## 约定
 

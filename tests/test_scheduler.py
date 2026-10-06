@@ -73,9 +73,11 @@ class BasicExecutionTest(unittest.TestCase):
         self.assertEqual(snap.accepted, 2)
         self.assertEqual(snap.completed, 1)
         self.assertEqual(snap.failed, 1)
-        # 失败任务同样贡献延迟样本。
+        # 失败任务同样贡献延迟样本（含执行耗时）。
         self.assertGreater(snap.total_latency_ms["max"], 0.0)
         self.assertEqual(len(_samples(snap, "total")), 2)
+        self.assertEqual(len(_samples(snap, "execution")), 2)
+        self.assertGreater(snap.execution_ms["max"], 0.0)
 
     def test_result_readable_after_close(self) -> None:
         s = Scheduler(workers=2, max_pending=4)
@@ -506,12 +508,106 @@ class SnapshotLatencyTest(unittest.TestCase):
         self.assertEqual(snap.completed, 10)
         self.assertEqual(len(_samples(snap, "wait")), 10)
         self.assertEqual(len(_samples(snap, "total")), 10)
-        for dist in (snap.queue_wait_ms, snap.total_latency_ms):
+        self.assertEqual(len(_samples(snap, "execution")), 10)
+        for dist in (snap.queue_wait_ms, snap.total_latency_ms,
+                     snap.execution_ms):
             for key in ("p50", "p95", "p99", "max"):
                 self.assertIn(key, dist)
         self.assertGreaterEqual(
             snap.total_latency_ms["max"], snap.queue_wait_ms["max"]
         )
+        # 执行耗时不超过总时延（总时延 = 排队等待 + 执行，同以三位小数计）。
+        self.assertGreaterEqual(
+            snap.total_latency_ms["max"], snap.execution_ms["max"]
+        )
+
+
+class ExecutionTimingTest(unittest.TestCase):
+    def test_execution_excludes_pre_claim_queue_wait(self) -> None:
+        # 单工作线程：首个任务占住线程，第二个任务排队约 150ms 后才被认领，
+        # 而其 callable 立即返回。execution_ms 必须只反映认领后的执行时间
+        # （约 0），不含认领前的排队等待。
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=4) as s:
+            holder = s.submit_nowait("hold", lambda: release.wait(2.0))
+            self.assertTrue(_wait_accepted(s, 1))
+            queued = s.submit_nowait("q", lambda: None)
+            self.assertTrue(_wait_accepted(s, 2))
+            time.sleep(0.15)  # 让 queued 在认领前排队等待一段时间。
+            release.set()
+            holder.result(2.0)
+            queued.result(2.0)
+            snap = s.snapshot()
+
+        # 样本按结束顺序追加：holder 先结束、queued 认领后立即结束。
+        wait_samples = _samples(snap, "wait")
+        total_samples = _samples(snap, "total")
+        exec_samples = _samples(snap, "execution")
+        self.assertEqual(len(exec_samples), 2)
+        queued_wait, queued_total = wait_samples[1], total_samples[1]
+        queued_exec = exec_samples[1]
+        self.assertGreaterEqual(queued_wait, 100.0)
+        self.assertLess(queued_exec, 50.0)
+        # 总时延 ≈ 排队等待 + 执行耗时（三者各自保留三位小数）。
+        self.assertAlmostEqual(
+            queued_total, queued_wait + queued_exec, delta=1.0
+        )
+
+    def test_failure_contributes_one_sample_and_keeps_original_exception(self) -> None:
+        def boom() -> None:
+            raise ValueError("boom")
+
+        with Scheduler(workers=2, max_pending=4) as s:
+            with self.assertRaises(ValueError) as cm:
+                s.submit("f1", boom)
+            self.assertEqual(str(cm.exception), "boom")
+            h = s.submit_nowait("f2", boom)
+            # TaskHandle.result 与 Scheduler.result 都原样抛出 callable 异常。
+            with self.assertRaises(ValueError):
+                h.result(2.0)
+            with self.assertRaises(ValueError):
+                s.result("f2")
+            snap = s.snapshot()
+
+        self.assertEqual(snap.failed, 2)
+        self.assertEqual(snap.completed, 0)
+        # 每个失败任务恰好贡献一个执行耗时样本。
+        self.assertEqual(len(_samples(snap, "execution")), 2)
+        self.assertEqual(set(snap.execution_ms), {"p50", "p95", "p99", "max"})
+
+    def test_cancelled_expired_invalid_leave_no_execution_sample(self) -> None:
+        release = threading.Event()
+        with Scheduler(workers=1, max_pending=3) as s:
+            running = s.submit_nowait("run", lambda: release.wait(2.0))
+            self.assertTrue(_wait_accepted(s, 1))
+
+            canc = s.submit_nowait("c", lambda: None)
+            self.assertTrue(_wait_accepted(s, 2))
+            self.assertTrue(canc.cancel())
+            with self.assertRaises(TaskCancelledError):
+                canc.result(2.0)
+
+            exp = s.submit_nowait("e", lambda: None, max_queue_wait_ms=30)
+            with self.assertRaises(QueueTimeoutError):
+                exp.result(2.0)
+
+            # 参数校验失败：不接纳、不执行、不贡献样本。
+            with self.assertRaises(InputValidationError):
+                s.submit("", lambda: None)
+
+            # 此时唯一执行中的任务尚未结束，尚无任何执行样本。
+            self.assertEqual(len(_samples(s.snapshot(), "execution")), 0)
+
+            release.set()
+            running.result(2.0)
+            snap = s.snapshot()
+
+        self.assertEqual(snap.cancelled, 1)
+        self.assertEqual(snap.expired, 1)
+        self.assertEqual(snap.completed, 1)
+        # 只有真正执行的 running 贡献一个 execution_ms 样本。
+        self.assertEqual(len(_samples(snap, "execution")), 1)
+        self.assertEqual(snap.execution_ms["max"], _samples(snap, "execution")[0])
 
 
 _EMPTY_DIST = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
@@ -529,6 +625,7 @@ class StatsCheckpointTest(unittest.TestCase):
             )
             self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
             self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
+            self.assertEqual(interval.execution_ms, _EMPTY_DIST)
             self.assertEqual(set(interval.to_dict()),
                              set(s.snapshot().to_dict()))
 
@@ -543,14 +640,15 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.completed, 1)
             self.assertEqual(len(_samples(interval, "wait")), 1)
             self.assertEqual(len(_samples(interval, "total")), 1)
+            self.assertEqual(len(_samples(interval, "execution")), 1)
             # 累计 snapshot 仍是两个任务。
             total = s.snapshot()
             self.assertEqual(total.accepted, 2)
             self.assertEqual(total.completed, 2)
 
     def test_cross_boundary_task_split_by_moments(self) -> None:
-        # 边界前接纳、边界后结束：accepted 不计入区间，completed 与两类
-        # 延迟样本计入区间。
+        # 边界前接纳、边界后结束：accepted 不计入区间，completed 与三类
+        # 延迟样本（含 execution_ms）计入区间。
         release = threading.Event()
 
         def wait_then_done() -> None:
@@ -569,6 +667,7 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.failed, 0)
             self.assertEqual(len(_samples(interval, "wait")), 1)
             self.assertEqual(len(_samples(interval, "total")), 1)
+            self.assertEqual(len(_samples(interval, "execution")), 1)
         # 区间快照在调度器关闭后仍可复算，值不变。
         self.assertEqual(interval.completed, 1)
 
@@ -594,6 +693,8 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.failed, 1)
             self.assertEqual(interval.completed, 0)
             self.assertEqual(len(_samples(interval, "total")), 1)
+            # 失败任务的执行样本同样按结束时刻落入边界后区间。
+            self.assertEqual(len(_samples(interval, "execution")), 1)
 
     def test_two_boundaries_split_accept_and_finish(self) -> None:
         # 接纳落在第一区间，结束落在第二区间：跨区间任务在接纳区间计
@@ -655,6 +756,8 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.accepted, 0)
             self.assertEqual(interval.cancelled, 1)
             self.assertEqual(len(_samples(interval, "wait")), 0)
+            # 认领前取消不贡献执行样本。
+            self.assertEqual(len(_samples(interval, "execution")), 0)
             release.set()
             running.result(2.0)
 
@@ -679,6 +782,8 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.accepted, 0)
             self.assertEqual(interval.expired, 1)
             self.assertEqual(len(_samples(interval, "wait")), 0)
+            # 认领前到期不贡献执行样本。
+            self.assertEqual(len(_samples(interval, "execution")), 0)
             release.set()
             running.result(2.0)
 
@@ -724,6 +829,7 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(tail.accepted, 0)
         self.assertEqual(tail.completed, 0)
         self.assertEqual(tail.queue_wait_ms, _EMPTY_DIST)
+        self.assertEqual(tail.execution_ms, _EMPTY_DIST)
         # 已结束任务结果在关闭后照常读取。
         self.assertEqual(s.result("a"), 1)
 
@@ -737,7 +843,9 @@ class StatsCheckpointTest(unittest.TestCase):
                         StatsSnapshot(
                             accepted=0, completed=0, failed=0,
                             cancelled=0, expired=0, rejected=0,
-                            queue_wait_samples=[], total_latency_samples=[],
+                            queue_wait_samples=[],
+                            total_latency_samples=[],
+                            execution_samples=[],
                         )):
                 with self.subTest(bad=bad):
                     with self.assertRaises(InputValidationError):
@@ -1589,9 +1697,11 @@ def _wait_accepted(s: Scheduler, n: int) -> bool:
 def _samples(snap: "object", kind: str) -> list[float]:
     # 通过私有样本构造分布的长度间接验证；这里直接用快照属性重算。
     from edge_sched.stats import _distribution  # type: ignore[attr-defined]
-    attr = (
-        "_queue_wait_samples" if kind == "wait" else "_total_latency_samples"
-    )
+    attr = {
+        "wait": "_queue_wait_samples",
+        "total": "_total_latency_samples",
+        "execution": "_execution_samples",
+    }[kind]
     return getattr(snap, attr)
 
 

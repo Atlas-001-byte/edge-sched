@@ -43,14 +43,18 @@ class StatsTest(unittest.TestCase):
             snap.total_latency_ms,
             {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
         )
+        self.assertEqual(
+            snap.execution_ms,
+            {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
+        )
 
     def test_cumulative_counts_and_samples(self) -> None:
         stats = Stats()
         stats.record_accepted()
         stats.record_rejected()
-        stats.record_finished(1.5, 5.25, success=True)
+        stats.record_finished(1.5, 5.25, 3.75, success=True)
         stats.record_accepted()
-        stats.record_finished(2.5, 9.0, success=False)
+        stats.record_finished(2.5, 9.0, 6.5, success=False)
 
         snap = stats.snapshot()
         self.assertEqual(snap.accepted, 2)
@@ -61,6 +65,9 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(snap.queue_wait_ms["max"], 2.5)
         self.assertEqual(snap.total_latency_ms["max"], 9.0)
         self.assertEqual(snap.total_latency_ms["p50"], 5.25)
+        # 成功与失败任务各贡献一个 execution_ms 样本。
+        self.assertEqual(snap.execution_ms["max"], 6.5)
+        self.assertEqual(snap.execution_ms["p50"], 3.75)
 
     def test_cancelled_count_no_samples(self) -> None:
         stats = Stats()
@@ -73,6 +80,7 @@ class StatsTest(unittest.TestCase):
         # 取消任务不贡献任何延迟样本。
         self.assertEqual(snap.queue_wait_ms["max"], 0.0)
         self.assertEqual(snap.total_latency_ms["max"], 0.0)
+        self.assertEqual(snap.execution_ms["max"], 0.0)
 
     def test_expired_count_no_samples(self) -> None:
         stats = Stats()
@@ -86,33 +94,37 @@ class StatsTest(unittest.TestCase):
         # 到期任务不贡献任何延迟样本。
         self.assertEqual(snap.queue_wait_ms["max"], 0.0)
         self.assertEqual(snap.total_latency_ms["max"], 0.0)
+        self.assertEqual(snap.execution_ms["max"], 0.0)
 
     def test_snapshot_is_fixed(self) -> None:
         stats = Stats()
         stats.record_accepted()
-        stats.record_finished(1.0, 1.0, success=True)
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
         first = stats.snapshot()
 
         stats.record_accepted()
-        stats.record_finished(2.0, 2.0, success=True)
+        stats.record_finished(2.0, 2.0, 2.0, success=True)
 
         # 早先快照不随后续任务变化。
         self.assertEqual(first.accepted, 1)
         self.assertEqual(first.total_latency_ms["max"], 1.0)
+        self.assertEqual(first.execution_ms["max"], 1.0)
         self.assertEqual(stats.snapshot().total_latency_ms["max"], 2.0)
+        self.assertEqual(stats.snapshot().execution_ms["max"], 2.0)
 
     def test_to_dict_shape(self) -> None:
         stats = Stats()
         stats.record_accepted()
-        stats.record_finished(0.1236, 0.9994, success=True)
+        stats.record_finished(0.1236, 0.9994, 0.8758, success=True)
         d = stats.snapshot().to_dict()
         self.assertEqual(set(d), {
             "accepted", "completed", "failed", "cancelled", "expired",
-            "rejected", "queue_wait_ms", "total_latency_ms",
+            "rejected", "queue_wait_ms", "total_latency_ms", "execution_ms",
         })
         # 毫秒保留三位小数。
         self.assertEqual(d["total_latency_ms"]["max"], 0.999)
         self.assertEqual(d["queue_wait_ms"]["max"], 0.124)
+        self.assertEqual(d["execution_ms"]["max"], 0.876)
 
 
 _EMPTY_DIST = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
@@ -130,6 +142,7 @@ class StatsCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
         self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
+        self.assertEqual(interval.execution_ms, _EMPTY_DIST)
         # to_dict 形态与累计 snapshot 完全一致。
         self.assertEqual(set(interval.to_dict()),
                          set(stats.snapshot().to_dict()))
@@ -137,12 +150,12 @@ class StatsCheckpointTest(unittest.TestCase):
     def test_interval_counts_and_samples(self) -> None:
         stats = Stats()
         stats.record_accepted()
-        stats.record_finished(1.0, 2.0, success=True)
+        stats.record_finished(1.0, 2.0, 1.0, success=True)
 
         cp = stats.checkpoint()
         # 接受时刻在区间内、结束时刻也在区间内。
         stats.record_accepted()
-        stats.record_finished(3.0, 6.0, success=False)
+        stats.record_finished(3.0, 6.0, 3.0, success=False)
         stats.record_rejected()
 
         interval = stats.snapshot_since(cp)
@@ -154,6 +167,8 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.expired, 0)
         self.assertEqual(interval.queue_wait_ms["max"], 3.0)
         self.assertEqual(interval.total_latency_ms["max"], 6.0)
+        # 区间内失败任务同样贡献一个 execution_ms 样本。
+        self.assertEqual(interval.execution_ms["max"], 3.0)
 
         # 累计统计不受区间查询影响。
         total = stats.snapshot()
@@ -162,14 +177,15 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(total.failed, 1)
         self.assertEqual(total.rejected, 1)
         self.assertEqual(total.total_latency_ms["max"], 6.0)
+        self.assertEqual(total.execution_ms["max"], 3.0)
 
     def test_cross_boundary_task_attribution(self) -> None:
         # 任务在边界前 accepted，边界后才 finished：accepted 归前一区间，
-        # completed 与延迟样本归后一区间。
+        # completed 与延迟样本（含 execution_ms）归后一区间。
         stats = Stats()
         stats.record_accepted()
         cp = stats.checkpoint()
-        stats.record_finished(4.0, 8.0, success=True)
+        stats.record_finished(4.0, 8.0, 4.0, success=True)
 
         interval = stats.snapshot_since(cp)
         self.assertEqual(interval.accepted, 0)
@@ -177,6 +193,7 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.failed, 0)
         self.assertEqual(interval.queue_wait_ms["max"], 4.0)
         self.assertEqual(interval.total_latency_ms["max"], 8.0)
+        self.assertEqual(interval.execution_ms["max"], 4.0)
 
     def test_cancelled_and_expired_follow_their_moments(self) -> None:
         stats = Stats()
@@ -194,12 +211,13 @@ class StatsCheckpointTest(unittest.TestCase):
         # 取消/到期不贡献任何延迟样本。
         self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
         self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
+        self.assertEqual(interval.execution_ms, _EMPTY_DIST)
 
     def test_repeated_query_is_stable_and_non_mutating(self) -> None:
         stats = Stats()
         cp = stats.checkpoint()
         stats.record_accepted()
-        stats.record_finished(1.0, 1.0, success=True)
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
         first = stats.snapshot_since(cp)
         second = stats.snapshot_since(cp)
         self.assertEqual(first.accepted, 1)
@@ -213,12 +231,12 @@ class StatsCheckpointTest(unittest.TestCase):
         stats = Stats()
         cp0 = stats.checkpoint()
         stats.record_accepted()
-        stats.record_finished(1.0, 1.0, success=True)
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
         cp1 = stats.checkpoint()
         # 第一区间的快照须在第二区间事件发生前取得（快照本身不可变）。
         first = stats.snapshot_since(cp0)
         stats.record_accepted()
-        stats.record_finished(2.0, 2.0, success=False)
+        stats.record_finished(2.0, 2.0, 2.0, success=False)
         cp2 = stats.checkpoint()
         second = stats.snapshot_since(cp1)
         tail = stats.snapshot_since(cp2)
@@ -236,6 +254,9 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(first.failed + second.failed, total.failed)
         self.assertEqual(first.total_latency_ms["max"], 1.0)
         self.assertEqual(second.total_latency_ms["max"], 2.0)
+        self.assertEqual(first.execution_ms["max"], 1.0)
+        self.assertEqual(second.execution_ms["max"], 2.0)
+        self.assertEqual(tail.execution_ms, _EMPTY_DIST)
         # 区间快照的 to_dict 形态与累计快照一致。
         self.assertEqual(set(first.to_dict()), set(total.to_dict()))
 

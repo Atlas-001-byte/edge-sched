@@ -139,7 +139,7 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(stats["expired"], 0)
         self.assertEqual(stats["rejected"], 0)
-        for group in ("queue_wait_ms", "total_latency_ms"):
+        for group in ("queue_wait_ms", "total_latency_ms", "execution_ms"):
             self.assertEqual(
                 set(stats[group]), {"p50", "p95", "p99", "max"}
             )
@@ -165,6 +165,26 @@ class CliSuccessTest(unittest.TestCase):
         )
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
+        self.assertEqual(stats["execution_ms"],
+                         {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0})
+
+    def test_execution_ms_reflects_only_running_time(self) -> None:
+        # workers=1：后一个任务排队等待前一个执行完毕，但其自身 execution_ms
+        # 只统计认领后的实际空等待时间，不包含认领前的排队等待。
+        tasks = [
+            {"task_id": "long", "sleep_ms": 120},
+            {"task_id": "instant", "sleep_ms": 0},
+        ]
+        report = self._execute(tasks, workers=1, max_pending=2)
+        stats = report["stats"]
+        self.assertEqual(stats["completed"], 2)
+        self.assertEqual(stats["expired"], 0)
+        # 结果按输入顺序；execution_ms 样本同样按结束顺序（long 先、instant 后）。
+        self.assertGreaterEqual(stats["execution_ms"]["max"], 100.0)
+        # 两个任务都成功结束，各贡献一个执行样本（通过 p50 仅能验证分布存在，
+        # 长度在调度器层测试覆盖），到期/取消数为 0。
+        self.assertEqual(set(stats["execution_ms"]),
+                         {"p50", "p95", "p99", "max"})
 
     def test_priority_optional_default_zero_and_output_input_order(self) -> None:
         # priority 缺省或为负都合法；结果数组严格按输入顺序返回，
@@ -208,6 +228,11 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["completed"], 2)
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(stats["cancelled"], 0)
+        # 到期任务不贡献 execution_ms：分布只来自 slow/ok 两个真正执行的任务，
+        # 其 max 是 slow 的执行时长（明显大于到期阈值 20ms）。
+        self.assertEqual(set(stats["execution_ms"]),
+                         {"p50", "p95", "p99", "max"})
+        self.assertGreaterEqual(stats["execution_ms"]["max"], 300.0)
 
 
 class CliModuleTest(unittest.TestCase):

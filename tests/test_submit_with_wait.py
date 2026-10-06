@@ -51,9 +51,11 @@ def _wait_admission_queue(s: Scheduler, n: int) -> bool:
 
 
 def _samples(snap: "object", kind: str) -> list:
-    attr = (
-        "_queue_wait_samples" if kind == "wait" else "_total_latency_samples"
-    )
+    attr = {
+        "wait": "_queue_wait_samples",
+        "total": "_total_latency_samples",
+        "execution": "_execution_samples",
+    }[kind]
     return getattr(snap, attr)
 
 
@@ -693,6 +695,7 @@ class AdmissionStatsTest(unittest.TestCase):
         # 被拒不贡献任何延迟样本。
         self.assertEqual(len(_samples(snap, "wait")), 1)
         self.assertEqual(len(_samples(snap, "total")), 1)
+        self.assertEqual(len(_samples(snap, "execution")), 1)
 
     def test_successful_path_matches_submit_accounting(self) -> None:
         with Scheduler(workers=4, max_pending=8) as s:
@@ -706,6 +709,7 @@ class AdmissionStatsTest(unittest.TestCase):
         )
         self.assertEqual(len(_samples(snap, "wait")), 6)
         self.assertEqual(len(_samples(snap, "total")), 6)
+        self.assertEqual(len(_samples(snap, "execution")), 6)
 
 
 class AdmissionStressTest(unittest.TestCase):
@@ -763,6 +767,7 @@ class AdmissionStressTest(unittest.TestCase):
         finished = snap.completed + snap.failed
         self.assertEqual(len(_samples(snap, "wait")), finished)
         self.assertEqual(len(_samples(snap, "total")), finished)
+        self.assertEqual(len(_samples(snap, "execution")), finished)
 
 
 if __name__ == "__main__":

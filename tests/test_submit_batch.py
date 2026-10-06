@@ -688,6 +688,9 @@ class BatchTimeoutTest(unittest.TestCase):
             self.assertEqual(
                 len(interval._queue_wait_samples), 0  # type: ignore[attr-defined]
             )
+            self.assertEqual(
+                len(interval._execution_samples), 0  # type: ignore[attr-defined]
+            )
             release.set()
             r2.set()
         snap = s.snapshot()
@@ -941,6 +944,9 @@ class BatchQueueDeadlineTest(unittest.TestCase):
         t.join(2.0)
         s.close()
         self.assertEqual(result, {"v": "ok"})
+        # 准入等待（约 300ms）不计入 execution_ms：w 认领后立即返回。
+        # 样本按结束顺序：h 先结束、w 认领后立即结束。
+        self.assertLess(s.snapshot()._execution_samples[1], 50.0)  # type: ignore[attr-defined]
 
     def test_one_item_expires_after_admission_others_unaffected(self) -> None:
         entered = threading.Event()
@@ -1060,6 +1066,7 @@ class BatchStatsTest(unittest.TestCase):
             (5, 5, 0, 0),
         )
         self.assertEqual(len(snap._queue_wait_samples), 5)  # type: ignore[attr-defined]
+        self.assertEqual(len(snap._execution_samples), 5)  # type: ignore[attr-defined]
         s.close()
 
     def test_rejected_group_contributes_no_interval_events(self) -> None:
@@ -1201,6 +1208,9 @@ class BatchStressTest(unittest.TestCase):
         self.assertEqual(len(ran), snap.completed + snap.failed)
         self.assertEqual(
             len(ran), len(snap._queue_wait_samples)  # type: ignore[attr-defined]
+        )
+        self.assertEqual(
+            len(ran), len(snap._execution_samples)  # type: ignore[attr-defined]
         )
         self.assertLessEqual(snap.accepted, 2 * n_groups * 3)
 

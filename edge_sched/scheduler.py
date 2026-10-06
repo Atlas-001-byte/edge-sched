@@ -51,7 +51,12 @@
   StatsCheckpoint；snapshot_since 返回边界后事件构成的 StatsSnapshot
   （字段、分位口径与 to_dict 形态同 snapshot）。跨边界任务按接纳时刻计入
   接纳区间的 accepted，按结束时刻计入结束区间的 completed/failed 并贡献
-  延迟样本。关闭后仍可创建边界、查询历史区间。
+  queue_wait_ms / total_latency_ms / execution_ms 延迟样本。关闭后仍可
+  创建边界、查询历史区间。
+- 统计在两类既有延迟之外另计 execution_ms：从工作线程原子认领任务后
+  开始计时，到 callable 正常返回或抛出 Exception 为止（不含认领前排队
+  等待），成功与失败任务都恰好贡献一个执行耗时样本；未开始执行就被取消、
+  排队到期、提交被拒或校验失败的任务不贡献该样本。
 """
 
 from __future__ import annotations
@@ -608,9 +613,9 @@ class Scheduler:
 
         边界与所有统计事件在同一原子顺序上落定：accepted/rejected/
         cancelled/expired 按各自接纳、拒绝、取消、到期时刻归属，
-        completed/failed 及两类延迟样本按结束时刻归属。跨边界的任务因此
-        在接纳所在区间计入 accepted，在结束所在区间计入 completed 或
-        failed 并贡献延迟样本；边界两侧都不统计的事件不存在。
+        completed/failed 及三类延迟样本（含 execution_ms）按结束时刻归属。
+        跨边界的任务因此在接纳所在区间计入 accepted，在结束所在区间计入
+        completed 或 failed 并贡献延迟样本；边界两侧都不统计的事件不存在。
 
         同一 checkpoint 可反复用于 :meth:`snapshot_since`，不改变累计统计
         或后续区间；调度器关闭后仍可创建边界。
@@ -621,10 +626,10 @@ class Scheduler:
         """返回自 ``checkpoint`` 边界之后事件构成的区间统计快照。
 
         字段、分位口径与 :meth:`snapshot` 完全一致：六项计数只含边界后
-        事件，``queue_wait_ms`` / ``total_latency_ms`` 只收集边界后成功或
-        失败结束的任务样本；边界后无事件时计数全为 0，两个分布的
-        p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，不改变累计
-        统计、延迟样本或任务状态。
+        事件，``queue_wait_ms`` / ``total_latency_ms`` / ``execution_ms``
+        只收集边界后成功或失败结束的任务样本；边界后无事件时计数全为 0，
+        三个分布的 p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，
+        不改变累计统计、延迟样本或任务状态。
 
         - 调度器关闭后仍可查询历史区间。
         - ``checkpoint`` 不是 :class:`StatsCheckpoint`、由其他调度器创建
@@ -1240,6 +1245,7 @@ class Scheduler:
             # 认领成功（置 started）后 callable 必执行到底，cancel 必失败、
             # 时限不再生效；已取消/已到期则 callable 绝不执行，立即归还许可。
             # 认领时刻已逾截止时刻视为到期先发生：到期优先，callable 不执行。
+            start_time = 0.0
             with self._cond:
                 if entry.cancelled or entry.expired:
                     self._worker_slots.release()
@@ -1251,12 +1257,14 @@ class Scheduler:
                 else:
                     entry.started = True
                     expired = False
+                    # 执行计时起点锚定在锁内的原子认领时刻：不含认领前的
+                    # 排队等待，也不含释放锁到真正调用 callable 之间的调度空隙。
+                    start_time = time.monotonic()
             if expired:
                 entry.done.set()
                 self._worker_slots.release()
                 continue
 
-            start_time = time.monotonic()
             try:
                 value = entry.fn()
             except Exception as exc:  # 调度器吞掉异常以隔离任务，继续工作
@@ -1272,10 +1280,12 @@ class Scheduler:
 
             queue_wait_ms = to_ms(start_time - entry.submit_time)
             total_latency_ms = to_ms(end_time - entry.submit_time)
+            # 只统计真正执行 callable 的时间：认领后到正常返回或抛出 Exception。
+            execution_ms = to_ms(end_time - start_time)
 
             # 先记账再唤醒：被唤醒的 submit 调用方返回后即可读到一致统计。
             self._stats.record_finished(
-                queue_wait_ms, total_latency_ms, success
+                queue_wait_ms, total_latency_ms, execution_ms, success
             )
             with self._cond:
                 self._pending -= 1
