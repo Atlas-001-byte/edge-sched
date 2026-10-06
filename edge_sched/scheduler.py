@@ -75,6 +75,16 @@
   RollingStatsSnapshot（window_size、sampled_finished 与三个分布）。窗口
   只复用 record_finished 的已记账结束：取消、排队到期、拒绝、close 期间
   未接纳及执行中任务不入窗；累计与区间统计口径完全不变。
+- resize_workers 在运行时调整工作线程容量（并发执行上限，>= 1 的整数，
+  校验口径与构造参数 workers 一致）：目标值在 _cond 状态锁内原子生效，
+  并发调整按取得锁的先后串行、后一次覆盖前一次。扩容先补足工作线程再
+  放宽许可上限，新增容量立即可接收任务；缩容立即停止发放新许可——不
+  打断、不取消已认领并执行中的 callable（它们按原结果或原异常结束），
+  并发数随这些任务自然结束降回目标值，此后不得以旧上限启动新任务。
+  未认领任务继续排队，仍按 priority 降序、同优先级接受先后及 aging
+  语义派发；容量调整不改变 max_pending、准入 FIFO、成组原子性、排队
+  时限、取消、到期、背压、task_id 占用与释放、结果读取与 close 语义。
+  closing/closed 时调用抛 SchedulerClosedError。
 """
 
 from __future__ import annotations
@@ -109,6 +119,59 @@ _SENTINEL = object()
 
 # 事件循环在空闲时轮询停止信号的间隔（秒）。
 _DISPATCH_POLL = 0.05
+
+
+class _SlotGate:
+    """容量可在运行时调整的工作线程并发许可闸门。
+
+    占用语义与 ``threading.BoundedSemaphore`` 的“占满即等待”一致，但
+    许可总数可用 :meth:`set_capacity` 调整：
+
+    - 扩容：新容量立即生效，等待中的 acquire 随许可空出被唤醒。
+    - 缩容：新容量立即生效——``in_use >= capacity`` 时不再发放新许可；
+      已占用的许可不被回收，随持有者 :meth:`release` 归还，并发执行数
+      由此在已认领任务自然结束后降回目标值。
+
+    全部字段由内部 Condition 保护。调度器只在持有 ``_cond`` 时调用
+    :meth:`set_capacity`（锁序 _cond -> 本锁）；:meth:`acquire` 与
+    :meth:`release` 不触碰调度器状态，本锁内也不再反取其他锁。
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._cond = threading.Condition()
+        self._capacity = capacity
+        self._in_use = 0
+
+    def acquire(self, timeout: Optional[float] = None) -> bool:
+        """占用一个许可；占满时等待至超时（秒），超时未获得返回 False。"""
+        with self._cond:
+            if self._in_use < self._capacity:
+                self._in_use += 1
+                return True
+            if timeout is None:
+                while self._in_use >= self._capacity:
+                    self._cond.wait()
+            else:
+                deadline = time.monotonic() + timeout
+                while self._in_use >= self._capacity:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    self._cond.wait(remaining)
+            self._in_use += 1
+            return True
+
+    def release(self) -> None:
+        """归还一个许可，唤醒一个等待中的派发。"""
+        with self._cond:
+            self._in_use -= 1
+            self._cond.notify()
+
+    def set_capacity(self, capacity: int) -> None:
+        """调整许可总数并唤醒全部等待者；调用时须持有调度器 ``_cond``。"""
+        with self._cond:
+            self._capacity = capacity
+            self._cond.notify_all()
 
 
 class _TaskEntry:
@@ -322,7 +385,8 @@ class RuntimeSnapshot:
 
     固定字段:
 
-    - ``workers``：工作线程数（构造参数）。
+    - ``workers``：当前有效目标工作线程容量（构造值或最近一次
+      :meth:`Scheduler.resize_workers` 生效的目标值）。
     - ``max_pending``：未完成任务上限（构造参数）。
     - ``queued``：已接纳、尚未被工作线程认领且仍可执行的任务数；被取消、
       到期或已结束的任务不计，执行中的任务不计。
@@ -421,6 +485,9 @@ class Scheduler:
     增加 1；派发依次按有效优先级降序、原 priority 降序、接受先后升序。
     老化不抢占、不重排执行中任务，原子认领后有效优先级冻结。
 
+    工作线程容量可在运行时用 :meth:`resize_workers` 调整：目标值在状态
+    锁内原子生效，扩容立即可派发、缩容立即停发新许可但不打断执行中任务。
+
     :param workers: 工作线程数，必须为 >= 1 的整数。
     :param max_pending: 未完成任务（含排队中与执行中）上限，必须为 >= 1 的整数。
     :param aging_interval_ms: 可选排队优先级老化周期（毫秒），缺省 None
@@ -489,8 +556,9 @@ class Scheduler:
         self._inbound: list[tuple] = []
         self._accept_seq = 0
         self._ready: "queue.Queue[Any]" = queue.Queue()
-        # 空闲工作线程许可：事件循环派发前必须先取得一个许可。
-        self._worker_slots = threading.BoundedSemaphore(workers)
+        # 空闲工作线程许可：事件循环派发前必须先取得一个许可。许可总数
+        # 即当前有效目标容量，可由 resize_workers 在运行时调整。
+        self._worker_slots = _SlotGate(workers)
         self._stop_dispatcher = threading.Event()
 
         self._dispatcher = threading.Thread(
@@ -863,6 +931,56 @@ class Scheduler:
         except ValueError as exc:
             raise InputValidationError(str(exc)) from None
 
+    def resize_workers(self, workers: int) -> None:
+        """运行时调整工作线程容量（并发执行上限）。
+
+        - ``workers`` 只接受 >= 1 的整数；布尔值、0、负数、浮点数或其他
+          类型均抛 :class:`InputValidationError`，容量与任务状态不变。
+        - 与当前有效目标容量相同：无操作，正常返回。
+        - 调度器 closing 或 closed：抛 :class:`SchedulerClosedError`，
+          容量与任务状态均不改变。
+
+        目标容量在 ``_cond`` 状态锁内原子生效；并发调整按取得锁的先后
+        串行，后一次覆盖前一次。扩容先补足工作线程再放宽许可上限，新增
+        容量立即可接收任务；缩容立即停止发放新许可——不打断、不取消、
+        不提前结束已认领并执行中的 callable（它们仍按原值或原异常结束），
+        并发执行数可暂时超过目标容量，随这些任务自然结束降回目标值，此后
+        不再以旧上限启动新任务。未认领任务继续排队，仍按 priority 降序、
+        同优先级接受先后及 aging 语义派发，不会重复认领或漏派发。
+
+        容量调整不改变 max_pending、准入 FIFO、成组原子性、排队时限、
+        取消、到期、背压、task_id 占用与释放、结果读取与 close 语义；
+        :meth:`runtime_snapshot` 的 ``workers`` 报告调整后的当前有效
+        目标容量，已返回的快照不随调整变化。
+        """
+        if not self._is_positive_int(workers):
+            raise InputValidationError(
+                "workers must be an integer >= 1, got %r" % (workers,)
+            )
+        with self._cond:
+            if self._closing:
+                raise SchedulerClosedError("scheduler is closed")
+            if workers == self._workers:
+                # 相同容量：无操作。
+                return
+            self._workers = workers
+            if workers > len(self._worker_threads):
+                # 扩容：先补足工作线程，再放宽许可上限，使新增容量立即
+                # 可派发且立即有线程执行。线程只增不减：缩容后空闲线程
+                # 阻塞在就绪队列上，扩回时直接复用，不产生重复线程。
+                for i in range(len(self._worker_threads), workers):
+                    thread = threading.Thread(
+                        target=self._run_worker,
+                        name="edge-sched-worker-%d" % i,
+                        daemon=True,
+                    )
+                    self._worker_threads.append(thread)
+                    thread.start()
+            # 目标容量在状态锁内原子生效（锁序 _cond -> 闸门锁）：缩容
+            # 立即停发新许可，已占用许可随任务结束归还；扩容立即放行
+            # 等待中的派发。
+            self._worker_slots.set_capacity(workers)
+
     def close(self) -> None:
         """关闭调度器。
 
@@ -906,8 +1024,8 @@ class Scheduler:
             self._inbound_cond.notify_all()
         self._dispatcher.join()
 
-        # 每个工作线程一个停止哨兵。
-        for _ in range(self._workers):
+        # 每个工作线程一个停止哨兵（含 resize_workers 运行期新增的线程）。
+        for _ in range(len(self._worker_threads)):
             self._ready.put(_SENTINEL)
         for t in self._worker_threads:
             t.join()
