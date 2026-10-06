@@ -16,13 +16,22 @@
 统计事件相同的锁内创建不可变的 :class:`StatsCheckpoint` 边界，
 :meth:`Stats.snapshot_since` 返回该边界之后事件构成的 :class:`StatsSnapshot`。
 每个事件在创建边界的原子顺序上只落入一侧，相邻区间既不重复也不遗漏。
+
+构造时还可选启用滑动窗口延迟观测（rolling_window 为保留的最近结束任务
+数，None 关闭）：窗口按任务结束顺序保留最近 N 个任务的
+（queue_wait_ms、total_latency_ms、execution_ms）三元组并同步进出，
+:meth:`Stats.rolling_snapshot` 返回不可变 :class:`RollingStatsSnapshot`。
+窗口样本只在与累计/区间记账同一把锁、同一次 record_finished 内追加，
+故只含已记账的成功/失败结束；取消、到期、拒绝、未接纳任务永不入窗。
+窗口与累计计数、延迟样本、区间边界互不影响。
 """
 
 from __future__ import annotations
 
 import math
 import threading
-from typing import Dict, List
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 # 单调时钟差值（秒）-> 毫秒的换算因子。
 _SEC_PER_MS = 1_000.0
@@ -63,9 +72,13 @@ def _distribution(samples: List[float]) -> Dict[str, float]:
 
 
 class Stats:
-    """线程安全的累计计数器与延迟样本收集器。"""
+    """线程安全的累计计数器与延迟样本收集器。
 
-    def __init__(self) -> None:
+    ``rolling_window`` 为 None（缺省）时关闭滑动窗口观测；否则必须是
+    >= 1 的整数，窗口按任务结束顺序保留最近该数量个任务的三元延迟样本。
+    """
+
+    def __init__(self, rolling_window: Optional[int] = None) -> None:
         self._lock = threading.Lock()
         self._accepted = 0
         self._completed = 0
@@ -78,6 +91,13 @@ class Stats:
         # 执行耗时样本：与上述两类样本一一对应，每个成功或失败结束的任务
         # 恰好贡献一个；取消/到期/被拒任务不追加。
         self._execution: List[float] = []
+        # 滑动窗口：None 表示关闭；启用时是有界 deque，按任务结束顺序保留
+        # 最近 _rolling_window 个任务的（queue_wait_ms, total_latency_ms,
+        # execution_ms）三元组，超出容量时最旧的样本从同一端同步离开。
+        self._rolling_window = rolling_window
+        self._rolling: "Optional[Deque[Tuple[float, float, float]]]" = (
+            deque(maxlen=rolling_window) if rolling_window is not None else None
+        )
         # 区间边界：checkpoint_id -> 创建瞬间的（六项累计计数，三类样本长度）。
         # 边界数据保存在 Stats 内而不是 checkpoint 对象上：checkpoint 只是
         # 不可变令牌，任何被篡改/伪造的令牌都无法通过 id 校验。
@@ -107,7 +127,9 @@ class Stats:
         """记录一个已结束任务：成功计入 completed，否则计入 failed。
 
         成功或失败都恰好追加一个 execution_ms 执行耗时样本；queue_wait_ms /
-        total_latency_ms 样本与执行样本一一对应。
+        total_latency_ms 样本与执行样本一一对应。启用滑动窗口时，三类样本
+        组成的三元组在同一把锁、同一次记账内按结束顺序进入窗口（窗口已满
+        时最旧三元组同步离开），与累计样本和区间归属处于同一原子顺序。
         """
         with self._lock:
             if success:
@@ -117,6 +139,10 @@ class Stats:
             self._queue_wait.append(queue_wait_ms)
             self._total_latency.append(total_latency_ms)
             self._execution.append(execution_ms)
+            if self._rolling is not None:
+                self._rolling.append(
+                    (queue_wait_ms, total_latency_ms, execution_ms)
+                )
 
     def snapshot(self) -> "StatsSnapshot":
         """返回当前累计值的不可变快照；不随后续任务变化。"""
@@ -131,6 +157,25 @@ class Stats:
                 queue_wait_samples=list(self._queue_wait),
                 total_latency_samples=list(self._total_latency),
                 execution_samples=list(self._execution),
+            )
+
+    def rolling_snapshot(self) -> "RollingStatsSnapshot":
+        """返回当前滑动窗口的不可变快照（值拷贝，创建后不再变化）。
+
+        窗口内的三元组在与累计/区间统计相同的锁内复制，故与
+        :meth:`snapshot` / :meth:`snapshot_since` 处于同一记账顺序：只含
+        已经记账的成功/失败结束，且三类样本严格同步（同属窗口内那批结束
+        任务）。未启用窗口时返回 window_size=0、sampled_finished=0 与三个
+        空分布的快照。可反复调用，不改变累计统计、区间或窗口内容。
+        """
+        with self._lock:
+            if self._rolling is None:
+                return RollingStatsSnapshot(
+                    window_size=0, samples=[]
+                )
+            return RollingStatsSnapshot(
+                window_size=self._rolling_window,  # type: ignore[arg-type]
+                samples=list(self._rolling),
             )
 
     def checkpoint(self) -> "StatsCheckpoint":
@@ -316,3 +361,89 @@ class StatsCheckpoint:
             return "StatsCheckpoint(id=%d)" % (self._checkpoint_id,)
         except AttributeError:
             return "StatsCheckpoint(<corrupted>)"
+
+
+class RollingStatsSnapshot:
+    """滑动窗口延迟观测的不可变快照。
+
+    只能由 :class:`Stats`（通常经 :meth:`Scheduler.rolling_snapshot`）创建：
+    全部字段在统计锁的同一次持锁区间内由窗口当前内容拷贝得到，构成同一
+    记账时刻的一致只读视图，创建后不再随任务结束而变化。
+
+    固定字段:
+
+    - ``window_size``：窗口容量 N（构造参数 latency_window_tasks）；
+      未启用窗口时为 0。
+    - ``sampled_finished``：窗口内当前保留的结束任务数（即三类分布共用的
+      样本数）；窗口未满时等于启用后成功/失败结束的任务总数，窗口满后恒为
+      ``window_size``。未启用窗口时为 0。
+    - ``queue_wait_ms`` / ``total_latency_ms`` / ``execution_ms``：窗口内
+      样本（按任务结束顺序）构造的 p50/p95/p99/max 分布，键、ceil(n*q)
+      取位与三位小数口径与 :class:`StatsSnapshot` 完全一致；空窗口四个值
+      均为 0.0。三类样本来自同一批结束任务的三元组，严格一一对应。
+
+    字段创建后不可赋值或删除；:meth:`to_dict` 只返回上述同名且 JSON 可
+    序列化的字典，重复读取结果稳定。
+    """
+
+    __slots__ = (
+        "window_size",
+        "sampled_finished",
+        "_queue_wait_samples",
+        "_total_latency_samples",
+        "_execution_samples",
+    )
+
+    def __init__(self, *, window_size: int,
+                 samples: "List[Tuple[float, float, float]]") -> None:
+        triples = list(samples)
+        object.__setattr__(self, "window_size", window_size)
+        object.__setattr__(self, "sampled_finished", len(triples))
+        object.__setattr__(
+            self, "_queue_wait_samples", [t[0] for t in triples]
+        )
+        object.__setattr__(
+            self, "_total_latency_samples", [t[1] for t in triples]
+        )
+        object.__setattr__(
+            self, "_execution_samples", [t[2] for t in triples]
+        )
+
+    @property
+    def queue_wait_ms(self) -> Dict[str, float]:
+        return _distribution(self._queue_wait_samples)
+
+    @property
+    def total_latency_ms(self) -> Dict[str, float]:
+        return _distribution(self._total_latency_samples)
+
+    @property
+    def execution_ms(self) -> Dict[str, float]:
+        return _distribution(self._execution_samples)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("RollingStatsSnapshot is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("RollingStatsSnapshot is immutable")
+
+    def to_dict(self) -> Dict[str, object]:
+        """转为只含固定字段、可 JSON 序列化的字典。"""
+        return {
+            "window_size": self.window_size,
+            "sampled_finished": self.sampled_finished,
+            "queue_wait_ms": self.queue_wait_ms,
+            "total_latency_ms": self.total_latency_ms,
+            "execution_ms": self.execution_ms,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试辅助
+        return (
+            "RollingStatsSnapshot(window_size={w}, sampled_finished={n}, "
+            "queue_wait_ms={qw}, total_latency_ms={tl}, "
+            "execution_ms={ex})".format(
+                w=self.window_size, n=self.sampled_finished,
+                qw=self.queue_wait_ms, tl=self.total_latency_ms,
+                ex=self.execution_ms,
+            )
+        )

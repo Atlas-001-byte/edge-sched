@@ -68,6 +68,16 @@
   oldest_admission_wait_ms 分别从最早未认领任务的接纳时刻、最早等待调用
   的发起时刻算至快照时刻（单调时钟，毫秒保留三位小数，无对象为 0.0，执行
   中任务不计前者）；closing/closed 反映当时状态。既有快照不随后续事件变化。
+- 构造时可选启用滑动窗口延迟观测（latency_window_tasks，缺省 None 关闭）：
+  启用后按任务结束顺序保留最近 N 个已记账结束（成功/失败）任务的
+  queue_wait_ms / total_latency_ms / execution_ms 三元样本，窗口满时最旧
+  三元组同步离开；样本在与累计/区间记账同一把锁、同一次 record_finished
+  内追加，故 rolling_snapshot 与 snapshot、snapshot_since 同刻边界一致，
+  只含已记账结束。取消、排队到期、拒绝、close 期间未接纳及执行中（未记账
+  结束）任务不入窗。rolling_snapshot 返回不可变 RollingStatsSnapshot
+  （window_size、sampled_finished 与三个沿用既有键/ceil(n*q)/三位小数
+  口径的分布，空值为 0.0）；未启用时 window_size=0、sampled_finished=0、
+  分布为空，close 后窗口仍可读取。窗口不影响累计与区间统计。
 """
 
 from __future__ import annotations
@@ -87,7 +97,13 @@ from .errors import (
     SchedulerClosedError,
     TaskCancelledError,
 )
-from .stats import Stats, StatsCheckpoint, StatsSnapshot, to_ms
+from .stats import (
+    RollingStatsSnapshot,
+    Stats,
+    StatsCheckpoint,
+    StatsSnapshot,
+    to_ms,
+)
 
 T = TypeVar("T")
 
@@ -413,10 +429,17 @@ class Scheduler:
     :param aging_interval_ms: 可选排队优先级老化周期（毫秒），缺省 None
         表示关闭老化；启用时只接受 >= 1 的整数，布尔值、零、负数、
         浮点数或其他类型均抛 :class:`InputValidationError`。
+    :param latency_window_tasks: 可选滑动窗口延迟观测容量（任务数），缺省
+        None 表示关闭；启用时只接受 >= 1 的整数，布尔值、零、负数、
+        浮点数或其他类型均抛 :class:`InputValidationError`。启用后窗口按
+        任务结束顺序保留最近 N 个已记账结束（成功/失败）任务的
+        queue_wait_ms / total_latency_ms / execution_ms 三元样本，经
+        :meth:`rolling_snapshot` 读取；取消、到期、拒绝、未接纳任务不入窗。
     """
 
     def __init__(self, workers: int, max_pending: int,
-                 aging_interval_ms: Optional[int] = None) -> None:
+                 aging_interval_ms: Optional[int] = None,
+                 latency_window_tasks: Optional[int] = None) -> None:
         if not self._is_positive_int(workers):
             raise InputValidationError(
                 "workers must be an integer >= 1, got %r" % (workers,)
@@ -431,9 +454,16 @@ class Scheduler:
                 "aging_interval_ms must be an integer >= 1 or None "
                 "(bool not allowed), got %r" % (aging_interval_ms,)
             )
+        if (latency_window_tasks is not None
+                and not self._is_positive_int(latency_window_tasks)):
+            raise InputValidationError(
+                "latency_window_tasks must be an integer >= 1 or None "
+                "(bool not allowed), got %r" % (latency_window_tasks,)
+            )
         self._workers = workers
         self._max_pending = max_pending
         self._aging_interval_ms = aging_interval_ms
+        self._latency_window_tasks = latency_window_tasks
 
         # _cond 同时承担状态锁：_closing/_closed/_pending/_unfinished 的读写。
         self._cond = threading.Condition()
@@ -452,7 +482,7 @@ class Scheduler:
         # 全部已接受任务的条目长期保留，关闭后结果仍可读取。
         self._tasks: dict[str, _TaskEntry] = {}
 
-        self._stats = Stats()
+        self._stats = Stats(rolling_window=latency_window_tasks)
         # 入站堆：项为
         # (-有效优先级, -原优先级, 接受序号, 条目)——有效优先级高者先派发
         # （含老化加成），其次原优先级高者，最后接受序号小者（先接受）先
@@ -725,6 +755,25 @@ class Scheduler:
     def snapshot(self) -> StatsSnapshot:
         """返回累计统计快照；快照为值拷贝，不随后续任务变化。"""
         return self._stats.snapshot()
+
+    def rolling_snapshot(self) -> "RollingStatsSnapshot":
+        """返回滑动窗口延迟观测的不可变快照
+        :class:`~edge_sched.stats.RollingStatsSnapshot`。
+
+        窗口样本在与累计计数、延迟样本、区间边界相同的统计锁内复制，故与
+        :meth:`snapshot` / :meth:`snapshot_since` 处于同一记账时刻边界：
+        只含已经记账的成功/失败结束，调用返回后窗口再变化也不影响已返回
+        的快照。窗口按任务结束顺序保留最近
+        ``latency_window_tasks`` 个任务的 queue_wait_ms /
+        total_latency_ms / execution_ms 三元样本（同步进出）；
+        ``sampled_finished`` 为窗口内结束任务数，窗口未满时等于启用后
+        成功/失败结束任务总数。取消、排队到期、拒绝以及 close 期间未被
+        接纳或仍在执行（未记账结束）的任务不入窗。观测只读，不改变任务
+        与统计，生命周期内（含 closing/closed）均可调用；close 后窗口仍
+        可读取。未启用窗口时返回 window_size=0、sampled_finished=0 与三个
+        空分布的快照，重复读取结果稳定。
+        """
+        return self._stats.rolling_snapshot()
 
     def runtime_snapshot(self) -> RuntimeSnapshot:
         """返回当前调度器状态的不可变即时观测 :class:`RuntimeSnapshot`。

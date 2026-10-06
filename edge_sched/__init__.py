@@ -21,6 +21,10 @@
   观测边界 :class:`~edge_sched.stats.StatsCheckpoint`。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot_since` -- 返回边界之后事件
   的区间统计快照（形态同累计快照）。
+- :func:`~edge_sched.scheduler.Scheduler.rolling_snapshot` -- 返回按任务结束
+  顺序保留最近 N 个已记账结束任务三元延迟样本的滑动窗口不可变观测
+  :class:`~edge_sched.stats.RollingStatsSnapshot`
+  （window_size/sampled_finished 与三个同口径分布；未启用时窗口为空）。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
   :class:`~edge_sched.errors.InputValidationError` /
@@ -38,13 +42,19 @@ from .errors import (
     TaskCancelledError,
 )
 from .scheduler import RuntimeSnapshot, Scheduler, TaskHandle
-from .stats import StatsCheckpoint, StatsSnapshot, percentile
+from .stats import (
+    RollingStatsSnapshot,
+    StatsCheckpoint,
+    StatsSnapshot,
+    percentile,
+)
 
 __all__ = [
     "Scheduler",
     "TaskHandle",
     "RuntimeSnapshot",
     "StatsSnapshot",
+    "RollingStatsSnapshot",
     "StatsCheckpoint",
     "percentile",
     "EdgeSchedError",
