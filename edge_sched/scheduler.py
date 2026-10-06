@@ -52,6 +52,11 @@
   （字段、分位口径与 to_dict 形态同 snapshot）。跨边界任务按接纳时刻计入
   接纳区间的 accepted，按结束时刻计入结束区间的 completed/failed 并贡献
   延迟样本。关闭后仍可创建边界、查询历史区间。
+- 统计含三类延迟分布（毫秒，保留三位小数）：queue_wait_ms（接受到开始
+  执行的排队等待）、execution_ms（工作线程原子认领后 callable 真正执行
+  的耗时，不含认领前等待）、total_latency_ms（接受到结束的总时延）。
+  成功与失败任务各恰好贡献一个 execution_ms 样本；未开始执行就被取消
+  或排队到期的任务不贡献该样本。
 """
 
 from __future__ import annotations
@@ -608,7 +613,7 @@ class Scheduler:
 
         边界与所有统计事件在同一原子顺序上落定：accepted/rejected/
         cancelled/expired 按各自接纳、拒绝、取消、到期时刻归属，
-        completed/failed 及两类延迟样本按结束时刻归属。跨边界的任务因此
+        completed/failed 及三类延迟样本按结束时刻归属。跨边界的任务因此
         在接纳所在区间计入 accepted，在结束所在区间计入 completed 或
         failed 并贡献延迟样本；边界两侧都不统计的事件不存在。
 
@@ -621,10 +626,10 @@ class Scheduler:
         """返回自 ``checkpoint`` 边界之后事件构成的区间统计快照。
 
         字段、分位口径与 :meth:`snapshot` 完全一致：六项计数只含边界后
-        事件，``queue_wait_ms`` / ``total_latency_ms`` 只收集边界后成功或
-        失败结束的任务样本；边界后无事件时计数全为 0，两个分布的
-        p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，不改变累计
-        统计、延迟样本或任务状态。
+        事件，``queue_wait_ms`` / ``execution_ms`` / ``total_latency_ms``
+        只收集边界后成功或失败结束的任务样本；边界后无事件时计数全为 0，
+        三个分布的 p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，
+        不改变累计统计、延迟样本或任务状态。
 
         - 调度器关闭后仍可查询历史区间。
         - ``checkpoint`` 不是 :class:`StatsCheckpoint`、由其他调度器创建
@@ -1271,11 +1276,13 @@ class Scheduler:
                 success = True
 
             queue_wait_ms = to_ms(start_time - entry.submit_time)
+            # 执行耗时：从认领后开始计时到 callable 返回/抛出，不含认领前等待。
+            execution_ms = to_ms(end_time - start_time)
             total_latency_ms = to_ms(end_time - entry.submit_time)
 
             # 先记账再唤醒：被唤醒的 submit 调用方返回后即可读到一致统计。
             self._stats.record_finished(
-                queue_wait_ms, total_latency_ms, success
+                queue_wait_ms, execution_ms, total_latency_ms, success
             )
             with self._cond:
                 self._pending -= 1

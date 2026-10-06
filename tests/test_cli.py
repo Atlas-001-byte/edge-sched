@@ -139,7 +139,7 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(stats["expired"], 0)
         self.assertEqual(stats["rejected"], 0)
-        for group in ("queue_wait_ms", "total_latency_ms"):
+        for group in ("queue_wait_ms", "execution_ms", "total_latency_ms"):
             self.assertEqual(
                 set(stats[group]), {"p50", "p95", "p99", "max"}
             )
@@ -164,6 +164,7 @@ class CliSuccessTest(unittest.TestCase):
             (0, 0, 0, 0, 0),
         )
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
+        self.assertEqual(stats["execution_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
 
     def test_priority_optional_default_zero_and_output_input_order(self) -> None:

@@ -505,8 +505,10 @@ class SnapshotLatencyTest(unittest.TestCase):
             snap = s.snapshot()
         self.assertEqual(snap.completed, 10)
         self.assertEqual(len(_samples(snap, "wait")), 10)
+        self.assertEqual(len(_samples(snap, "exec")), 10)
         self.assertEqual(len(_samples(snap, "total")), 10)
-        for dist in (snap.queue_wait_ms, snap.total_latency_ms):
+        for dist in (snap.queue_wait_ms, snap.execution_ms,
+                     snap.total_latency_ms):
             for key in ("p50", "p95", "p99", "max"):
                 self.assertIn(key, dist)
         self.assertGreaterEqual(
@@ -528,6 +530,7 @@ class StatsCheckpointTest(unittest.TestCase):
                 (0, 0, 0, 0, 0, 0),
             )
             self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
+            self.assertEqual(interval.execution_ms, _EMPTY_DIST)
             self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
             self.assertEqual(set(interval.to_dict()),
                              set(s.snapshot().to_dict()))
@@ -542,6 +545,7 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.accepted, 1)
             self.assertEqual(interval.completed, 1)
             self.assertEqual(len(_samples(interval, "wait")), 1)
+            self.assertEqual(len(_samples(interval, "exec")), 1)
             self.assertEqual(len(_samples(interval, "total")), 1)
             # 累计 snapshot 仍是两个任务。
             total = s.snapshot()
@@ -568,6 +572,7 @@ class StatsCheckpointTest(unittest.TestCase):
             self.assertEqual(interval.completed, 1)
             self.assertEqual(interval.failed, 0)
             self.assertEqual(len(_samples(interval, "wait")), 1)
+            self.assertEqual(len(_samples(interval, "exec")), 1)
             self.assertEqual(len(_samples(interval, "total")), 1)
         # 区间快照在调度器关闭后仍可复算，值不变。
         self.assertEqual(interval.completed, 1)
@@ -724,6 +729,7 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(tail.accepted, 0)
         self.assertEqual(tail.completed, 0)
         self.assertEqual(tail.queue_wait_ms, _EMPTY_DIST)
+        self.assertEqual(tail.execution_ms, _EMPTY_DIST)
         # 已结束任务结果在关闭后照常读取。
         self.assertEqual(s.result("a"), 1)
 
@@ -737,7 +743,8 @@ class StatsCheckpointTest(unittest.TestCase):
                         StatsSnapshot(
                             accepted=0, completed=0, failed=0,
                             cancelled=0, expired=0, rejected=0,
-                            queue_wait_samples=[], total_latency_samples=[],
+                            queue_wait_samples=[], execution_samples=[],
+                            total_latency_samples=[],
                         )):
                 with self.subTest(bad=bad):
                     with self.assertRaises(InputValidationError):
@@ -1589,9 +1596,11 @@ def _wait_accepted(s: Scheduler, n: int) -> bool:
 def _samples(snap: "object", kind: str) -> list[float]:
     # 通过私有样本构造分布的长度间接验证；这里直接用快照属性重算。
     from edge_sched.stats import _distribution  # type: ignore[attr-defined]
-    attr = (
-        "_queue_wait_samples" if kind == "wait" else "_total_latency_samples"
-    )
+    attr = {
+        "wait": "_queue_wait_samples",
+        "exec": "_execution_samples",
+        "total": "_total_latency_samples",
+    }[kind]
     return getattr(snap, attr)
 
 

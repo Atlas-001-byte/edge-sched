@@ -16,7 +16,8 @@
 优先级任务最终获得派发机会；不传该参数时派发语义与之前完全一致。每个
 任务执行一次对应的空等待
 （``time.sleep``），完成后向标准输出打印任务结果（仍按输入顺序）与
-调度器统计快照（JSON）。到期任务的结果对象只含 ``task_id`` 与
+调度器统计快照（JSON，含 queue_wait_ms / execution_ms /
+total_latency_ms 三个延迟分布）。到期任务的结果对象只含 ``task_id`` 与
 ``error``（固定为 ``"QueueTimeoutError"``），成功对象只含 ``task_id``
 与 ``result``。
 
