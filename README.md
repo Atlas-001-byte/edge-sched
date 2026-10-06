@@ -113,6 +113,26 @@
   字段保持不变，只在 stats 中新增 `execution_ms`；提交、返回、取消、
   到期、背压、task_id 占用、结果读取、关闭语义、输入校验与优先级派发
   顺序均不变，也不另建落盘文件。
+- 增量：即时运行观测。新增 `Scheduler.runtime_snapshot()`，从 `edge_sched`
+  导出不可变 `RuntimeSnapshot`；在与提交、认领、取消、到期、名额释放及
+  close 相同的 `_cond` 锁内、按同一单调时刻只读状态，不改变任务、等待者
+  与统计，生命周期内（含 closing/closed）均可调用。固定属性为 `workers`、
+  `max_pending`、`queued`、`running`、`unfinished`、
+  `admission_waiters`、`admission_waiting_tasks`、`available_capacity`、
+  `oldest_queued_age_ms`、`oldest_admission_wait_ms`、`closing`、`closed`；
+  `to_dict()` 只返回同名且 JSON 可序列化的字典，属性不可赋值或删除。
+  `queued` 为已接纳、未被工作线程认领且仍可执行的任务，`running` 为已
+  认领未终态的任务，`unfinished` 恒为二者之和（取消、到期、已结束不计）；
+  `admission_waiters` 只计仍在等容量的 `submit_with_wait` /
+  `submit_batch_with_wait` 调用，`admission_waiting_tasks` 计其占用的
+  task_id（成组按组内任务数计，接纳即退出，不与已接纳任务重复计数）；
+  `available_capacity = max(0, max_pending - unfinished)`。
+  `oldest_queued_age_ms` 与 `oldest_admission_wait_ms` 分别从最早未认领
+  任务的接纳时刻、最早等待调用的发起时刻算至快照时刻，无对象为 0.0，
+  单调时钟毫秒保留三位小数，执行中任务不计前者。事件与 close 交错时
+  快照仍一致；close 后无 queued/running/admission_waiters，
+  `closing`/`closed` 反映当时状态，已返回的快照不随后续事件变化。现有
+  公开 API、统计、异常与 CLI 不变，且不产生任何落盘文件。
 
 ## 约定
 

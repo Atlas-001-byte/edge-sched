@@ -13,6 +13,10 @@
   FIFO 准入队列中等待（后续单任务/小组不得绕过），按输入顺序返回
   :class:`~edge_sched.scheduler.TaskHandle` 元组。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
+- :func:`~edge_sched.scheduler.Scheduler.runtime_snapshot` -- 同一逻辑时刻的
+  不可变即时运行观测 :class:`~edge_sched.scheduler.RuntimeSnapshot`
+  （workers/容量/queued/running/unfinished、准入等待者与其占用任务数、
+  最早排队与等待耗时、closing/closed），只读、不改任务与统计。
 - :func:`~edge_sched.scheduler.Scheduler.stats_checkpoint` -- 创建区间统计
   观测边界 :class:`~edge_sched.stats.StatsCheckpoint`。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot_since` -- 返回边界之后事件
@@ -33,12 +37,13 @@ from .errors import (
     SchedulerClosedError,
     TaskCancelledError,
 )
-from .scheduler import Scheduler, TaskHandle
+from .scheduler import RuntimeSnapshot, Scheduler, TaskHandle
 from .stats import StatsCheckpoint, StatsSnapshot, percentile
 
 __all__ = [
     "Scheduler",
     "TaskHandle",
+    "RuntimeSnapshot",
     "StatsSnapshot",
     "StatsCheckpoint",
     "percentile",

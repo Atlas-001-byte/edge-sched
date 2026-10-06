@@ -57,6 +57,17 @@
   开始计时，到 callable 正常返回或抛出 Exception 为止（不含认领前排队
   等待），成功与失败任务都恰好贡献一个执行耗时样本；未开始执行就被取消、
   排队到期、提交被拒或校验失败的任务不贡献该样本。
+- runtime_snapshot 在与提交、认领、取消、到期、名额释放及 close 相同的
+  _cond 锁内取得同一逻辑时刻的不可变 RuntimeSnapshot：只读、不改变任务
+  与统计，全程（含 closing/closed）可调用。queued 为已接纳未认领且可执行
+  的任务数，running 为已认领未终态的任务数，unfinished 为二者之和；
+  admission_waiters 只计仍在等容量的 submit_with_wait /
+  submit_batch_with_wait 调用数，admission_waiting_tasks 计其占用的
+  task_id 数（成组按组内任务数计），接纳即退出等待；available_capacity =
+  max(0, max_pending - unfinished)；oldest_queued_age_ms 与
+  oldest_admission_wait_ms 分别从最早未认领任务的接纳时刻、最早等待调用
+  的发起时刻算至快照时刻（单调时钟，毫秒保留三位小数，无对象为 0.0，执行
+  中任务不计前者）；closing/closed 反映当时状态。既有快照不随后续事件变化。
 """
 
 from __future__ import annotations
@@ -208,14 +219,20 @@ class _AdmissionWaiter:
     不随等待线程被调度唤醒的先后而改变。
     """
 
-    __slots__ = ("items", "admitted", "closed", "entries")
+    __slots__ = ("items", "admitted", "closed", "entries", "wait_start")
 
-    def __init__(self, items: "list[_AdmissionItem]") -> None:
+    def __init__(self, items: "list[_AdmissionItem]",
+                 wait_start: Optional[float] = None) -> None:
         self.items = items
         self.admitted = False
         self.closed = False
         # 与 items 等长、同序：提升后每项对应一个已建好的任务条目。
         self.entries: "Optional[list[_TaskEntry]]" = None
+        # 等待发起时刻（单调时钟秒）：入队瞬间在 _cond 锁内记录，
+        # runtime_snapshot 的 oldest_admission_wait_ms 据此起算。
+        self.wait_start = (
+            time.monotonic() if wait_start is None else wait_start
+        )
 
     @property
     def size(self) -> int:
@@ -283,6 +300,102 @@ class TaskHandle:
         raise entry.exception
 
 
+class RuntimeSnapshot:
+    """调度器在某一逻辑时刻的不可变即时运行观测。
+
+    只能由 :class:`Scheduler` 经 :meth:`Scheduler.runtime_snapshot` 创建：
+    全部字段在 ``Scheduler._cond`` 同一次持锁区间内读取，构成同一逻辑时刻
+    的一致只读视图，创建后不再随任务接纳、认领、取消、到期或 close 变化。
+
+    固定字段:
+
+    - ``workers``：工作线程数（构造参数）。
+    - ``max_pending``：未完成任务上限（构造参数）。
+    - ``queued``：已接纳、尚未被工作线程认领且仍可执行的任务数；被取消、
+      到期或已结束的任务不计，执行中的任务不计。
+    - ``running``：已被工作线程原子认领、尚未进入终态的任务数。
+    - ``unfinished``：``queued + running``；取消、到期与已结束任务不计。
+    - ``admission_waiters``：仍在准入队列中等待容量的 submit_with_wait /
+      submit_batch_with_wait **调用数**（成组调用算一个等待者）。
+    - ``admission_waiting_tasks``：上述等待者占用的 task_id 总数（成组按
+      组内任务数计）；等待任务尚未接纳，绝不与已接纳任务重复计数。
+    - ``available_capacity``：``max(0, max_pending - unfinished)``。
+    - ``oldest_queued_age_ms``：最早未认领任务自其接纳时刻至快照时刻的
+      毫秒数（单调时钟，保留三位小数），无排队任务为 0.0；执行中任务不计。
+    - ``oldest_admission_wait_ms``：最早等待调用自其发起时刻至快照时刻的
+      毫秒数（单调时钟，保留三位小数），无等待者为 0.0。
+    - ``closing`` / ``closed``：快照时刻 close 是否已开始 / 是否已完成。
+
+    字段创建后不可赋值或删除；:meth:`to_dict` 只返回同名且 JSON 可序列化
+    的字典。
+    """
+
+    __slots__ = (
+        "workers",
+        "max_pending",
+        "queued",
+        "running",
+        "unfinished",
+        "admission_waiters",
+        "admission_waiting_tasks",
+        "available_capacity",
+        "oldest_queued_age_ms",
+        "oldest_admission_wait_ms",
+        "closing",
+        "closed",
+    )
+
+    def __init__(self, *, workers: int, max_pending: int, queued: int,
+                 running: int, unfinished: int, admission_waiters: int,
+                 admission_waiting_tasks: int, available_capacity: int,
+                 oldest_queued_age_ms: float,
+                 oldest_admission_wait_ms: float,
+                 closing: bool, closed: bool) -> None:
+        for name, value in (
+            ("workers", workers),
+            ("max_pending", max_pending),
+            ("queued", queued),
+            ("running", running),
+            ("unfinished", unfinished),
+            ("admission_waiters", admission_waiters),
+            ("admission_waiting_tasks", admission_waiting_tasks),
+            ("available_capacity", available_capacity),
+            ("oldest_queued_age_ms", oldest_queued_age_ms),
+            ("oldest_admission_wait_ms", oldest_admission_wait_ms),
+            ("closing", closing),
+            ("closed", closed),
+        ):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("RuntimeSnapshot is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("RuntimeSnapshot is immutable")
+
+    def to_dict(self) -> dict:
+        """转为只含同名固定字段、可 JSON 序列化的字典。"""
+        return {
+            "workers": self.workers,
+            "max_pending": self.max_pending,
+            "queued": self.queued,
+            "running": self.running,
+            "unfinished": self.unfinished,
+            "admission_waiters": self.admission_waiters,
+            "admission_waiting_tasks": self.admission_waiting_tasks,
+            "available_capacity": self.available_capacity,
+            "oldest_queued_age_ms": self.oldest_queued_age_ms,
+            "oldest_admission_wait_ms": self.oldest_admission_wait_ms,
+            "closing": self.closing,
+            "closed": self.closed,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试辅助
+        return "RuntimeSnapshot(%s)" % (
+            ", ".join("%s=%r" % (k, v) for k, v in self.to_dict().items()),
+        )
+
+
 class Scheduler:
     """高并发任务调度器。
 
@@ -328,6 +441,11 @@ class Scheduler:
         self._closed = False
         self._pending = 0
         self._unfinished: set[str] = set()
+        # 已接纳但尚未被工作线程认领（仍在入站堆等待派发）且未进入取消/
+        # 到期终态的任务 id。只在 _cond 锁内维护：接纳即加入，原子认领、
+        # 取消或到期即在同一把锁内移除——故其基数恒等于 queued，无需在
+        # 快照时按 started/done 复检。
+        self._queued: set[str] = set()
         # submit_with_wait 的阻塞准入队列：队首是等待最久的调用。
         # 等待者在入队时即占用 task_id，但不占 pending 额度、不产生任务。
         self._admission_queue: "deque[_AdmissionWaiter]" = deque()
@@ -608,6 +726,65 @@ class Scheduler:
         """返回累计统计快照；快照为值拷贝，不随后续任务变化。"""
         return self._stats.snapshot()
 
+    def runtime_snapshot(self) -> RuntimeSnapshot:
+        """返回当前调度器状态的不可变即时观测 :class:`RuntimeSnapshot`。
+
+        全部字段在 ``_cond`` 的同一次持锁区间、按同一个单调时刻读取：与
+        接纳、认领、取消、到期、名额释放、准入等待者进退及 close 处于同一
+        原子顺序，故快照内 ``queued + running == unfinished``、等待任务不会
+        同时计入 ``admission_waiting_tasks`` 与已接纳任务。观测只读：不创建
+        或改变任何任务、等待者与统计，也不影响派发；在调度器生命周期内
+        （含 closing 中与 closed 后）均可调用。close 开始后准入等待者立即
+        清空，close 完成后 queued/running/admission_waiters 均为 0；
+        已返回的快照不随后续事件变化。
+        """
+        with self._cond:
+            now = time.monotonic()
+            queued = len(self._queued)
+            # _pending 计全部已接纳未终态任务；_queued 是其中尚未认领者，
+            # 差额即已被工作线程原子认领、仍在执行的任务。二者在同一把锁上
+            # 维护，故恒有 queued + running == _pending == unfinished。
+            unfinished = self._pending
+            running = unfinished - queued
+
+            waiters = len(self._admission_queue)
+            waiting_tasks = sum(
+                waiter.size for waiter in self._admission_queue
+            )
+
+            oldest_queued: Optional[float] = None
+            for task_id in self._queued:
+                submit_time = self._tasks[task_id].submit_time
+                if oldest_queued is None or submit_time < oldest_queued:
+                    oldest_queued = submit_time
+            oldest_wait: Optional[float] = None
+            for waiter in self._admission_queue:
+                if oldest_wait is None or waiter.wait_start < oldest_wait:
+                    oldest_wait = waiter.wait_start
+
+            return RuntimeSnapshot(
+                workers=self._workers,
+                max_pending=self._max_pending,
+                queued=queued,
+                running=running,
+                unfinished=unfinished,
+                admission_waiters=waiters,
+                admission_waiting_tasks=waiting_tasks,
+                available_capacity=max(
+                    0, self._max_pending - unfinished
+                ),
+                oldest_queued_age_ms=(
+                    to_ms(now - oldest_queued)
+                    if oldest_queued is not None else 0.0
+                ),
+                oldest_admission_wait_ms=(
+                    to_ms(now - oldest_wait)
+                    if oldest_wait is not None else 0.0
+                ),
+                closing=self._closing,
+                closed=self._closed,
+            )
+
     def stats_checkpoint(self) -> StatsCheckpoint:
         """创建一个区间统计观测边界。
 
@@ -782,6 +959,7 @@ class Scheduler:
         )
         self._tasks[task_id] = entry
         self._unfinished.add(task_id)
+        self._queued.add(task_id)
         self._pending += 1
         self._stats.record_accepted()
         self._enqueue_inbound_locked(entry, admit_time)
@@ -973,6 +1151,7 @@ class Scheduler:
             )
             self._tasks[item.task_id] = entry
             self._unfinished.add(item.task_id)
+            self._queued.add(item.task_id)
             self._pending += 1
             self._stats.record_accepted()
             self._enqueue_inbound_locked(entry, admit_time)
@@ -1025,6 +1204,7 @@ class Scheduler:
             )
             self._pending -= 1
             self._unfinished.discard(entry.task_id)
+            self._queued.discard(entry.task_id)
             self._stats.record_cancelled()
             # 名额释放：若有准入等待者，在锁内考察队首——余量足以容纳其
             # 整组时一次性接纳，否则本次释放不接纳任何人。
@@ -1052,6 +1232,7 @@ class Scheduler:
         )
         self._pending -= 1
         self._unfinished.discard(entry.task_id)
+        self._queued.discard(entry.task_id)
         self._stats.record_expired()
         # 到期同样释放名额：一次释放只考察队首（可能是成组调用）。
         self._promote_waiter_locked()
@@ -1257,6 +1438,9 @@ class Scheduler:
                 else:
                     entry.started = True
                     expired = False
+                    # 原子认领：任务离开 queued 进入 running；终态前
+                    # _pending/_unfinished 仍保留其名额。
+                    self._queued.discard(entry.task_id)
                     # 执行计时起点锚定在锁内的原子认领时刻：不含认领前的
                     # 排队等待，也不含释放锁到真正调用 callable 之间的调度空隙。
                     start_time = time.monotonic()
