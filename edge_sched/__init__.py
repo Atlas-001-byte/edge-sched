@@ -28,6 +28,12 @@
   未启用时窗口容量与样本数均为 0。
 - :func:`~edge_sched.scheduler.Scheduler.resize_workers` -- 运行时调整
   工作线程容量：扩容立即可派发，缩容立即停发新许可但不打断执行中任务。
+- :func:`~edge_sched.scheduler.Scheduler.cancel_many` -- 在同一原子状态边界
+  内批量取消多个本调度器创建的 TaskHandle：参数必须是非空 list/tuple（空
+  集合、按身份判重的重复句柄、非 TaskHandle、其他调度器的句柄抛
+  InputValidationError），返回与输入等长同序的布尔元组，成功取消沿用单项
+  取消语义并立即释放名额、按 FIFO 提升等待者；close 之后调用不抛
+  SchedulerClosedError。
 - :class:`~edge_sched.errors.BackpressureError` / :class:`~edge_sched.errors.DuplicateTaskError`
   / :class:`~edge_sched.errors.SchedulerClosedError` /
   :class:`~edge_sched.errors.InputValidationError` /
