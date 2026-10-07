@@ -24,7 +24,9 @@ queue_wait_ms / total_latency_ms / execution_ms 三元样本，最终 stats
 调度器统计快照（JSON）。快照在既有 ``queue_wait_ms`` /
 ``total_latency_ms`` 之外另含同形态的 ``execution_ms``：仅统计任务被
 工作线程原子认领后真正执行空等待的时间，成功与失败任务各贡献一个样本，
-到期任务不贡献。到期任务的结果对象只含 ``task_id`` 与
+到期任务不贡献。快照还始终包含 ``admission_wait_ms`` 分布：每个被接纳
+任务贡献一个容量准入等待样本（CLI 的提交在调用瞬间取得名额，故均为
+0.0），形态同为 p50/p95/p99/max，空分布为 0.0。到期任务的结果对象只含 ``task_id`` 与
 ``error``（固定为 ``"QueueTimeoutError"``），成功对象只含 ``task_id``
 与 ``result``。
 

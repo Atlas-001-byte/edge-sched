@@ -158,6 +158,26 @@
   stats 新增 `rolling`，其值等于 `RollingStatsSnapshot.to_dict()`，结果
   数组与既有 stats 字段、退出码与输入顺序输出不变；非法值在标准错误
   打印 `InputValidationError` 并以退出码 2 结束，不落盘。
+- 增量：容量准入等待分布。累计 `snapshot` 与区间 `snapshot_since` 的
+  `StatsSnapshot` 在既有字段之外新增同形态（p50/p95/p99/max，毫秒保留
+  三位小数，`ceil(n*q)` 分位，空分布四个值均为 0.0）的
+  `admission_wait_ms` 属性，`to_dict()` 同步增加同名字段。每次**有效
+  提交**（四个提交入口中被原子接纳的任务）恰好贡献一个样本：调用瞬间
+  取得名额记 `0.0`；只有进入容量等待队列后，才从入队时刻（等待者发起
+  时刻）算到被原子提升接纳的时刻。`submit_batch_with_wait` 整组接纳时
+  组内每个任务产生相同样本。容量不足得到 `BackpressureError`、参数
+  问题得到 `InputValidationError`、同名得到 `DuplicateTaskError`、
+  `close` 后未接纳得到 `SchedulerClosedError` 的请求均不产生样本；任务
+  接纳后无论最终成功、失败、取消或排队到期，样本都保留。样本按接纳
+  时刻归属区间：跨 checkpoint 的任务把准入样本放入接纳区间（与
+  `accepted` 同刻），其 `queue_wait_ms`/`total_latency_ms`/
+  `execution_ms` 结束样本仍进入结束区间。快照仍是不可变值拷贝、可 JSON
+  序列化并可重复读取；累计六项计数、三类既有延迟分布、滑动窗口、
+  `TaskHandle.result`、`Scheduler.result`、取消、到期、背压、关闭、输入
+  校验、准入 FIFO 与结果顺序语义均不变。`python -m edge_sched` 的最终
+  stats 始终包含 `admission_wait_ms`（CLI 提交均在调用瞬间获名额，样本
+  为 `0.0`），结果数组仍按输入顺序，退出码与既有结果对象不变，不创建
+  落盘文件。
 
 ## 约定
 

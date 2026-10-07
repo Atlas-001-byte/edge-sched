@@ -48,6 +48,10 @@ class StatsTest(unittest.TestCase):
             snap.execution_ms,
             {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
         )
+        self.assertEqual(
+            snap.admission_wait_ms,
+            {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
+        )
 
     def test_cumulative_counts_and_samples(self) -> None:
         stats = Stats()
@@ -121,11 +125,40 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(set(d), {
             "accepted", "completed", "failed", "cancelled", "expired",
             "rejected", "queue_wait_ms", "total_latency_ms", "execution_ms",
+            "admission_wait_ms",
         })
         # 毫秒保留三位小数。
         self.assertEqual(d["total_latency_ms"]["max"], 0.999)
         self.assertEqual(d["queue_wait_ms"]["max"], 0.124)
         self.assertEqual(d["execution_ms"]["max"], 0.876)
+        # 未显式传入准入等待时为即时接纳样本 0.0。
+        self.assertEqual(d["admission_wait_ms"],
+                         {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0})
+
+    def test_admission_wait_samples_track_accepted(self) -> None:
+        stats = Stats()
+        stats.record_accepted()                 # 即时接纳 0.0
+        stats.record_rejected()                 # 被拒不追加准入样本
+        stats.record_accepted(12.5)
+        stats.record_accepted(7.25)
+        snap = stats.snapshot()
+        self.assertEqual(snap.accepted, 3)
+        self.assertEqual(snap.rejected, 1)
+        self.assertEqual(
+            snap.admission_wait_ms,
+            {"p50": 7.25, "p95": 12.5, "p99": 12.5, "max": 12.5},
+        )
+        # 取消/到期不影响准入样本：接纳时样本即已固定保留。
+        stats.record_cancelled()
+        stats.record_expired()
+        later = stats.snapshot()
+        self.assertEqual(later.admission_wait_ms, snap.admission_wait_ms)
+        # 快照为值拷贝：早先快照不随后续接纳变化。
+        stats.record_accepted(40.0)
+        self.assertEqual(stats.snapshot().admission_wait_ms["max"], 40.0)
+        self.assertEqual(snap.admission_wait_ms["max"], 12.5)
+        # 准入样本可 JSON 序列化。
+        json.dumps(stats.snapshot().to_dict())
 
 
 _EMPTY_DIST = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
@@ -144,6 +177,7 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
         self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
         self.assertEqual(interval.execution_ms, _EMPTY_DIST)
+        self.assertEqual(interval.admission_wait_ms, _EMPTY_DIST)
         # to_dict 形态与累计 snapshot 完全一致。
         self.assertEqual(set(interval.to_dict()),
                          set(stats.snapshot().to_dict()))
@@ -155,7 +189,7 @@ class StatsCheckpointTest(unittest.TestCase):
 
         cp = stats.checkpoint()
         # 接受时刻在区间内、结束时刻也在区间内。
-        stats.record_accepted()
+        stats.record_accepted(5.5)
         stats.record_finished(3.0, 6.0, 3.0, success=False)
         stats.record_rejected()
 
@@ -170,6 +204,10 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.total_latency_ms["max"], 6.0)
         # 区间内失败任务同样贡献一个 execution_ms 样本。
         self.assertEqual(interval.execution_ms["max"], 3.0)
+        # 准入样本按接纳时刻归属：只含边界后那次接纳（5.5），边界前的
+        # 默认 0.0 样本不得混入。
+        self.assertEqual(interval.admission_wait_ms["max"], 5.5)
+        self.assertEqual(interval.admission_wait_ms["p50"], 5.5)
 
         # 累计统计不受区间查询影响。
         total = stats.snapshot()
@@ -179,6 +217,25 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(total.rejected, 1)
         self.assertEqual(total.total_latency_ms["max"], 6.0)
         self.assertEqual(total.execution_ms["max"], 3.0)
+        self.assertEqual(total.admission_wait_ms["max"], 5.5)
+
+    def test_admission_wait_follows_acceptance_not_finish(self) -> None:
+        # 跨边界任务：准入样本在接纳区间（边界前），边界后结束不把准入
+        # 样本带入结束区间。
+        stats = Stats()
+        stats.record_accepted(9.0)
+        cp = stats.checkpoint()
+        stats.record_finished(4.0, 8.0, 4.0, success=True)
+        interval = stats.snapshot_since(cp)
+        self.assertEqual(interval.accepted, 0)
+        self.assertEqual(interval.completed, 1)
+        self.assertEqual(interval.admission_wait_ms, _EMPTY_DIST)
+        # 边界后再接纳一个：准入样本即落入该区间，即使任务尚未结束。
+        stats.record_accepted(2.0)
+        later = stats.snapshot_since(cp)
+        self.assertEqual(later.accepted, 1)
+        self.assertEqual(later.completed, 1)
+        self.assertEqual(later.admission_wait_ms["max"], 2.0)
 
     def test_cross_boundary_task_attribution(self) -> None:
         # 任务在边界前 accepted，边界后才 finished：accepted 归前一区间，

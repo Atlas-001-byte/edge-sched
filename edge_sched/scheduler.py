@@ -50,13 +50,27 @@
 - stats_checkpoint 在与统计事件相同的锁内创建不可变区间边界
   StatsCheckpoint；snapshot_since 返回边界后事件构成的 StatsSnapshot
   （字段、分位口径与 to_dict 形态同 snapshot）。跨边界任务按接纳时刻计入
-  接纳区间的 accepted，按结束时刻计入结束区间的 completed/failed 并贡献
-  queue_wait_ms / total_latency_ms / execution_ms 延迟样本。关闭后仍可
-  创建边界、查询历史区间。
+  接纳区间的 accepted 与 admission_wait_ms，按结束时刻计入结束区间的
+  completed/failed 并贡献 queue_wait_ms / total_latency_ms /
+  execution_ms 延迟样本。关闭后仍可创建边界、查询历史区间。
 - 统计在两类既有延迟之外另计 execution_ms：从工作线程原子认领任务后
   开始计时，到 callable 正常返回或抛出 Exception 为止（不含认领前排队
   等待），成功与失败任务都恰好贡献一个执行耗时样本；未开始执行就被取消、
   排队到期、提交被拒或校验失败的任务不贡献该样本。
+- 累计与区间统计另计 admission_wait_ms 容量准入等待分布：每个被原子
+  接纳的任务（submit / submit_nowait / submit_with_wait /
+  submit_batch_with_wait）在接纳瞬间恰好贡献一个样本。调用瞬间取得
+  名额记 0.0；只有进入容量等待队列后，才从入队时刻（_AdmissionWaiter
+  的发起时刻）算到被原子提升接纳的时刻（单调时钟，毫秒保留三位小数）。
+  submit_batch_with_wait 整组接纳时组内每个任务产生相同样本。容量不足
+  的 BackpressureError、参数问题的 InputValidationError、同名的
+  DuplicateTaskError 与 close 后未获接纳的 SchedulerClosedError 请求
+  均不产生样本；任务一旦接纳，无论最终成功、失败、取消或排队到期，其
+  准入样本都保留。样本按接纳时刻归属：跨 stats_checkpoint 的任务把
+  准入样本放入接纳区间（与 accepted 同刻），其 queue_wait_ms /
+  total_latency_ms / execution_ms 结束样本仍进入结束区间。
+  StatsSnapshot.to_dict 在既有字段之外增加同名字段，空分布为
+  p50/p95/p99/max 全 0.0；滑动窗口不收该样本。
 - runtime_snapshot 在与提交、认领、取消、到期、名额释放及 close 相同的
   _cond 锁内取得同一逻辑时刻的不可变 RuntimeSnapshot：只读、不改变任务
   与统计，全程（含 closing/closed）可调用。queued 为已接纳未认领且可执行
@@ -903,9 +917,12 @@ class Scheduler:
 
         边界与所有统计事件在同一原子顺序上落定：accepted/rejected/
         cancelled/expired 按各自接纳、拒绝、取消、到期时刻归属，
-        completed/failed 及三类延迟样本（含 execution_ms）按结束时刻归属。
-        跨边界的任务因此在接纳所在区间计入 accepted，在结束所在区间计入
-        completed 或 failed 并贡献延迟样本；边界两侧都不统计的事件不存在。
+        completed/failed 及三类延迟样本（含 execution_ms）按结束时刻归属；
+        admission_wait_ms 与 accepted 同刻按接纳时刻归属。
+        跨边界的任务因此在接纳所在区间计入 accepted 与 admission_wait_ms，
+        在结束所在区间计入 completed 或 failed 并贡献 queue_wait_ms /
+        total_latency_ms / execution_ms 结束样本；边界两侧都不统计的事件
+        不存在。
 
         同一 checkpoint 可反复用于 :meth:`snapshot_since`，不改变累计统计
         或后续区间；调度器关闭后仍可创建边界。
@@ -917,9 +934,11 @@ class Scheduler:
 
         字段、分位口径与 :meth:`snapshot` 完全一致：六项计数只含边界后
         事件，``queue_wait_ms`` / ``total_latency_ms`` / ``execution_ms``
-        只收集边界后成功或失败结束的任务样本；边界后无事件时计数全为 0，
-        三个分布的 p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，
-        不改变累计统计、延迟样本或任务状态。
+        只收集边界后成功或失败结束的任务样本，``admission_wait_ms`` 只
+        收集边界后被接纳任务的准入样本（与该区间 accepted 一一对应，
+        跨边界任务的准入样本在接纳区间、结束样本在结束区间）；边界后无
+        事件时计数全为 0，四个分布的 p50/p95/p99/max 均为 0.0。同一
+        checkpoint 可反复查询，不改变累计统计、延迟样本或任务状态。
 
         - 调度器关闭后仍可查询历史区间。
         - ``checkpoint`` 不是 :class:`StatsCheckpoint`、由其他调度器创建
@@ -1124,7 +1143,8 @@ class Scheduler:
         self._unfinished.add(task_id)
         self._queued.add(task_id)
         self._pending += 1
-        self._stats.record_accepted()
+        # submit / submit_nowait 不进入容量等待队列：准入样本恒为 0.0。
+        self._stats.record_accepted(0.0)
         self._enqueue_inbound_locked(entry, admit_time)
         return entry
 
@@ -1290,7 +1310,8 @@ class Scheduler:
         )
 
     def _register_admissions_locked(
-        self, items: "list[_AdmissionItem]"
+        self, items: "list[_AdmissionItem]",
+        admission_wait_ms: float = 0.0,
     ) -> "list[_TaskEntry]":
         """在容量已确认可容纳整组时，原子登记全部任务并入堆。
 
@@ -1300,7 +1321,10 @@ class Scheduler:
         （max_queue_wait_ms 的同一锚点），按输入顺序预留连续的接受序号
         （同级组内即输入顺序派发），accepted 一次增加组内任务数，随后各
         令牌按各自 priority 与 seq 原子推入入站堆（锁序
-        _cond -> _inbound_cond）。返回与 items 等长、同序的条目列表。
+        _cond -> _inbound_cond）。``admission_wait_ms`` 是本组共同的容量
+        准入等待样本：调用瞬间获名额为 0.0，等待者由提升处按入队时刻到
+        接纳时刻计算；组内每个任务记录同一值。返回与 items 等长、同序的
+        条目列表。
         """
         admit_time = time.monotonic()
         entries: "list[_TaskEntry]" = []
@@ -1316,7 +1340,7 @@ class Scheduler:
             self._unfinished.add(item.task_id)
             self._queued.add(item.task_id)
             self._pending += 1
-            self._stats.record_accepted()
+            self._stats.record_accepted(admission_wait_ms)
             self._enqueue_inbound_locked(entry, admit_time)
             entries.append(entry)
         return entries
@@ -1344,7 +1368,14 @@ class Scheduler:
             if self._pending + waiter.size > self._max_pending:
                 self._admission_queue.appendleft(waiter)
                 return False
-            waiter.entries = self._register_admissions_locked(waiter.items)
+            # 接纳时刻：准入等待样本从等待者入队（发起）时刻算到此刻，
+            # 组内每个任务在 _register_admissions_locked 记录同一值。
+            admission_wait_ms = to_ms(
+                time.monotonic() - waiter.wait_start
+            )
+            waiter.entries = self._register_admissions_locked(
+                waiter.items, admission_wait_ms
+            )
             waiter.admitted = True
             self._cond.notify_all()
             return True

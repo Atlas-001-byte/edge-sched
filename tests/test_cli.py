@@ -164,10 +164,14 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(stats["expired"], 0)
         self.assertEqual(stats["rejected"], 0)
-        for group in ("queue_wait_ms", "total_latency_ms", "execution_ms"):
+        for group in ("queue_wait_ms", "total_latency_ms", "execution_ms",
+                      "admission_wait_ms"):
             self.assertEqual(
                 set(stats[group]), {"p50", "p95", "p99", "max"}
             )
+        # CLI 提交在调用瞬间取得名额：准入等待样本全为 0.0。
+        self.assertEqual(stats["admission_wait_ms"],
+                         {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0})
 
     def test_tasks_actually_wait_and_run_parallel(self) -> None:
         # 4 个各 200ms 的任务跑在 4 线程上，总墙钟应明显小于串行 800ms。
@@ -191,6 +195,8 @@ class CliSuccessTest(unittest.TestCase):
         self.assertEqual(stats["queue_wait_ms"]["max"], 0.0)
         self.assertEqual(stats["total_latency_ms"]["p99"], 0.0)
         self.assertEqual(stats["execution_ms"],
+                         {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0})
+        self.assertEqual(stats["admission_wait_ms"],
                          {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0})
 
     def test_execution_ms_reflects_only_running_time(self) -> None:
