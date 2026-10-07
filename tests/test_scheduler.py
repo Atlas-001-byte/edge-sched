@@ -843,6 +843,7 @@ class StatsCheckpointTest(unittest.TestCase):
                         StatsSnapshot(
                             accepted=0, completed=0, failed=0,
                             cancelled=0, expired=0, rejected=0,
+                            admission_wait_samples=[],
                             queue_wait_samples=[],
                             total_latency_samples=[],
                             execution_samples=[],

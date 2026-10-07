@@ -50,9 +50,17 @@
 - stats_checkpoint 在与统计事件相同的锁内创建不可变区间边界
   StatsCheckpoint；snapshot_since 返回边界后事件构成的 StatsSnapshot
   （字段、分位口径与 to_dict 形态同 snapshot）。跨边界任务按接纳时刻计入
-  接纳区间的 accepted，按结束时刻计入结束区间的 completed/failed 并贡献
+  接纳区间的 accepted 并贡献 admission_wait_ms 准入等待样本，按结束时刻
+  计入结束区间的 completed/failed 并贡献
   queue_wait_ms / total_latency_ms / execution_ms 延迟样本。关闭后仍可
   创建边界、查询历史区间。
+- 统计另计 admission_wait_ms 准入等待分布：每次有效提交从进入容量准入
+  判定到被原子接纳的等待毫秒数（三位小数）。调用瞬间取得名额的提交记
+  0.0；进入过容量等待队列的从入队时刻算到接纳时刻，成组接纳时组内每个
+  任务产生相同样本。样本在接纳时刻入账（与 accepted 同一原子顺序），
+  此后无论任务成功、失败、取消或排队到期都保留；背压拒绝、参数校验
+  失败、同名冲突与 close 后未接纳的请求不产生样本。区间统计按接纳时刻
+  归属：跨 checkpoint 的任务其准入样本计入接纳区间。
 - 统计在两类既有延迟之外另计 execution_ms：从工作线程原子认领任务后
   开始计时，到 callable 正常返回或抛出 Exception 为止（不含认领前排队
   等待），成功与失败任务都恰好贡献一个执行耗时样本；未开始执行就被取消、
@@ -903,8 +911,11 @@ class Scheduler:
 
         边界与所有统计事件在同一原子顺序上落定：accepted/rejected/
         cancelled/expired 按各自接纳、拒绝、取消、到期时刻归属，
-        completed/failed 及三类延迟样本（含 execution_ms）按结束时刻归属。
-        跨边界的任务因此在接纳所在区间计入 accepted，在结束所在区间计入
+        admission_wait_ms 准入等待样本随 accepted 按接纳时刻归属，
+        completed/failed 及其余三类延迟样本（queue_wait_ms /
+        total_latency_ms / execution_ms）按结束时刻归属。
+        跨边界的任务因此在接纳所在区间计入 accepted 并贡献
+        admission_wait_ms 样本，在结束所在区间计入
         completed 或 failed 并贡献延迟样本；边界两侧都不统计的事件不存在。
 
         同一 checkpoint 可反复用于 :meth:`snapshot_since`，不改变累计统计
@@ -916,9 +927,10 @@ class Scheduler:
         """返回自 ``checkpoint`` 边界之后事件构成的区间统计快照。
 
         字段、分位口径与 :meth:`snapshot` 完全一致：六项计数只含边界后
-        事件，``queue_wait_ms`` / ``total_latency_ms`` / ``execution_ms``
+        事件，``admission_wait_ms`` 只收集边界后接纳的任务样本，
+        ``queue_wait_ms`` / ``total_latency_ms`` / ``execution_ms``
         只收集边界后成功或失败结束的任务样本；边界后无事件时计数全为 0，
-        三个分布的 p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，
+        四个分布的 p50/p95/p99/max 均为 0.0。同一 checkpoint 可反复查询，
         不改变累计统计、延迟样本或任务状态。
 
         - 调度器关闭后仍可查询历史区间。
@@ -1124,7 +1136,8 @@ class Scheduler:
         self._unfinished.add(task_id)
         self._queued.add(task_id)
         self._pending += 1
-        self._stats.record_accepted()
+        # 调用瞬间取得名额：准入等待样本记 0.0。
+        self._stats.record_accepted(0.0)
         self._enqueue_inbound_locked(entry, admit_time)
         return entry
 
@@ -1290,7 +1303,8 @@ class Scheduler:
         )
 
     def _register_admissions_locked(
-        self, items: "list[_AdmissionItem]"
+        self, items: "list[_AdmissionItem]",
+        wait_start: Optional[float] = None,
     ) -> "list[_TaskEntry]":
         """在容量已确认可容纳整组时，原子登记全部任务并入堆。
 
@@ -1301,8 +1315,16 @@ class Scheduler:
         （同级组内即输入顺序派发），accepted 一次增加组内任务数，随后各
         令牌按各自 priority 与 seq 原子推入入站堆（锁序
         _cond -> _inbound_cond）。返回与 items 等长、同序的条目列表。
+
+        ``wait_start`` 为等待者进入容量等待队列的时刻（单调时钟秒）；
+        None 表示调用瞬间即取得名额，准入等待样本记 0.0，否则按入队到
+        本接纳时刻计值，组内每个任务产生相同样本。
         """
         admit_time = time.monotonic()
+        # 准入等待样本：与接纳同一原子顺序入账，组内共享同一值。
+        admission_wait_ms = (
+            0.0 if wait_start is None else to_ms(admit_time - wait_start)
+        )
         entries: "list[_TaskEntry]" = []
         for item in items:
             seq = self._accept_seq
@@ -1316,7 +1338,7 @@ class Scheduler:
             self._unfinished.add(item.task_id)
             self._queued.add(item.task_id)
             self._pending += 1
-            self._stats.record_accepted()
+            self._stats.record_accepted(admission_wait_ms)
             self._enqueue_inbound_locked(entry, admit_time)
             entries.append(entry)
         return entries
@@ -1344,7 +1366,9 @@ class Scheduler:
             if self._pending + waiter.size > self._max_pending:
                 self._admission_queue.appendleft(waiter)
                 return False
-            waiter.entries = self._register_admissions_locked(waiter.items)
+            waiter.entries = self._register_admissions_locked(
+                waiter.items, wait_start=waiter.wait_start
+            )
             waiter.admitted = True
             self._cond.notify_all()
             return True

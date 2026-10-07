@@ -48,6 +48,10 @@ class StatsTest(unittest.TestCase):
             snap.execution_ms,
             {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
         )
+        self.assertEqual(
+            snap.admission_wait_ms,
+            {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0},
+        )
 
     def test_cumulative_counts_and_samples(self) -> None:
         stats = Stats()
@@ -120,12 +124,38 @@ class StatsTest(unittest.TestCase):
         d = stats.snapshot().to_dict()
         self.assertEqual(set(d), {
             "accepted", "completed", "failed", "cancelled", "expired",
-            "rejected", "queue_wait_ms", "total_latency_ms", "execution_ms",
+            "rejected", "admission_wait_ms", "queue_wait_ms",
+            "total_latency_ms", "execution_ms",
         })
         # 毫秒保留三位小数。
         self.assertEqual(d["total_latency_ms"]["max"], 0.999)
         self.assertEqual(d["queue_wait_ms"]["max"], 0.124)
         self.assertEqual(d["execution_ms"]["max"], 0.876)
+
+    def test_admission_wait_distribution(self) -> None:
+        stats = Stats()
+        # 空快照：准入等待为空分布。
+        self.assertEqual(stats.snapshot().admission_wait_ms, _EMPTY_DIST)
+        # 缺省 0.0：调用瞬间取得名额的提交。
+        stats.record_accepted()
+        stats.record_accepted(12.5)
+        stats.record_accepted(0.2504)
+        snap = stats.snapshot()
+        self.assertEqual(snap.accepted, 3)
+        self.assertEqual(
+            snap.admission_wait_ms,
+            {"p50": 0.25, "p95": 12.5, "p99": 12.5, "max": 12.5},
+        )
+        # 拒绝、取消、到期与结束记账都不追加准入等待样本。
+        stats.record_rejected()
+        stats.record_cancelled()
+        stats.record_expired()
+        stats.record_finished(1.0, 1.0, 1.0, success=True)
+        self.assertEqual(stats.snapshot().admission_wait_ms["max"], 12.5)
+        d = snap.to_dict()
+        self.assertEqual(d["admission_wait_ms"], snap.admission_wait_ms)
+        # 快照为值拷贝且可 JSON 序列化。
+        self.assertEqual(json.loads(json.dumps(d)), d)
 
 
 _EMPTY_DIST = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
@@ -144,6 +174,7 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.queue_wait_ms, _EMPTY_DIST)
         self.assertEqual(interval.total_latency_ms, _EMPTY_DIST)
         self.assertEqual(interval.execution_ms, _EMPTY_DIST)
+        self.assertEqual(interval.admission_wait_ms, _EMPTY_DIST)
         # to_dict 形态与累计 snapshot 完全一致。
         self.assertEqual(set(interval.to_dict()),
                          set(stats.snapshot().to_dict()))
@@ -195,6 +226,29 @@ class StatsCheckpointTest(unittest.TestCase):
         self.assertEqual(interval.queue_wait_ms["max"], 4.0)
         self.assertEqual(interval.total_latency_ms["max"], 8.0)
         self.assertEqual(interval.execution_ms["max"], 4.0)
+
+    def test_admission_wait_attributed_to_admission_interval(self) -> None:
+        # 准入等待样本按接纳时刻归属：边界前接纳的任务其样本计入前段区间，
+        # 即使它在边界后才结束；边界后接纳的任务样本计入本区间。
+        stats = Stats()
+        stats.record_accepted(7.5)
+        cp = stats.checkpoint()
+        stats.record_finished(1.0, 2.0, 1.0, success=True)
+        stats.record_accepted(0.0)
+        stats.record_accepted(3.25)
+
+        interval = stats.snapshot_since(cp)
+        self.assertEqual(interval.accepted, 2)
+        self.assertEqual(
+            interval.admission_wait_ms,
+            {"p50": 0.0, "p95": 3.25, "p99": 3.25, "max": 3.25},
+        )
+        # 累计快照含全部三个准入样本；结束区间仍收到结束任务的延迟样本。
+        total = stats.snapshot()
+        self.assertEqual(total.admission_wait_ms["max"], 7.5)
+        self.assertEqual(total.admission_wait_ms["p50"], 3.25)
+        self.assertEqual(interval.queue_wait_ms["max"], 1.0)
+        self.assertEqual(interval.execution_ms["max"], 1.0)
 
     def test_cancelled_and_expired_follow_their_moments(self) -> None:
         stats = Stats()

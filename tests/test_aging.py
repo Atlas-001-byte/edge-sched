@@ -306,7 +306,8 @@ class AgingTerminalStateTest(unittest.TestCase):
             set(snap.to_dict()),
             {
                 "accepted", "completed", "failed", "cancelled",
-                "expired", "rejected", "queue_wait_ms", "total_latency_ms",
+                "expired", "rejected", "admission_wait_ms",
+                "queue_wait_ms", "total_latency_ms",
                 "execution_ms",
             },
         )
@@ -358,8 +359,8 @@ class AgingCliTest(unittest.TestCase):
         self.assertEqual(
             set(report["stats"]),
             {"accepted", "completed", "failed", "cancelled", "expired",
-             "rejected", "queue_wait_ms", "total_latency_ms",
-             "execution_ms"},
+             "rejected", "admission_wait_ms", "queue_wait_ms",
+             "total_latency_ms", "execution_ms"},
         )
 
     def test_valid_flag_runs_and_preserves_input_order(self) -> None:

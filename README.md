@@ -158,6 +158,23 @@
   stats 新增 `rolling`，其值等于 `RollingStatsSnapshot.to_dict()`，结果
   数组与既有 stats 字段、退出码与输入顺序输出不变；非法值在标准错误
   打印 `InputValidationError` 并以退出码 2 结束，不落盘。
+- 增量：容量准入等待分布。`StatsSnapshot.to_dict()` 在既有字段之外新增
+  同形态（p50/p95/p99/max，`ceil(n*q)` 分位，毫秒保留三位小数，空分布
+  四个值均为 0.0）的 `admission_wait_ms`，`StatsSnapshot` 同时暴露
+  `admission_wait_ms` 属性。它统计每次有效提交从进入容量准入判定到被
+  原子接纳的等待时间：调用瞬间取得名额的提交记 0.0；只有进入容量等待
+  队列后，才从入队时刻算到接纳时刻；`submit_batch_with_wait` 整组接纳时
+  组内每个任务产生相同样本。样本在接纳时刻入账（与 `accepted` 同一原子
+  顺序），此后无论任务成功、失败、取消或排队到期都保留；容量不足的
+  `BackpressureError`、参数问题的 `InputValidationError`、同名的
+  `DuplicateTaskError` 以及 close 后未接纳的 `SchedulerClosedError`
+  请求均不产生样本。`stats_checkpoint` / `snapshot_since` 按接纳时刻
+  归属准入样本：跨 checkpoint 的任务其准入样本计入接纳区间，结束仍
+  进入结束区间。累计计数、`queue_wait_ms`、`total_latency_ms`、
+  `execution_ms`、`rolling_snapshot`、各提交入口、取消、到期、背压、
+  关闭与输入校验语义均不变；`python -m edge_sched` 的最终 stats 始终
+  包含 `admission_wait_ms`，结果数组仍按输入顺序，退出码与既有结果
+  对象不变，也不创建落盘文件。
 
 ## 约定
 

@@ -1,7 +1,12 @@
 """延迟分布统计。
 
-统计三类延迟样本（单位毫秒，保留三位小数）:
+统计四类延迟样本（单位毫秒，保留三位小数）:
 
+- ``admission_wait_ms`` -- 每次有效提交从进入容量准入判定到被原子接纳的
+  等待时间：调用瞬间取得名额的记 0.0，进入过容量等待队列的从入队时刻
+  算到接纳时刻；成组接纳时组内每个任务产生相同样本。样本在接纳时刻入账，
+  此后无论任务成功、失败、取消或排队到期都保留；背压拒绝、参数校验失败、
+  同名冲突与 close 后未接纳的请求不产生样本。
 - ``queue_wait_ms`` -- 任务从被接受到开始执行（工作线程原子认领）的排队等待时间。
 - ``total_latency_ms`` -- 任务从被接受到执行结束（成功或失败）的总时延。
 - ``execution_ms`` -- 任务从被工作线程原子认领后开始，到 callable 正常返回
@@ -86,6 +91,10 @@ class Stats:
         self._cancelled = 0
         self._expired = 0
         self._rejected = 0
+        # 准入等待样本：与 accepted 一一对应，每次接纳（含调用瞬间取得名额
+        # 的 0.0）恰好追加一个，按接纳时刻入账；任务后续无论成功、失败、
+        # 取消或到期都保留。
+        self._admission_wait: List[float] = []
         self._queue_wait: List[float] = []
         self._total_latency: List[float] = []
         # 执行耗时样本：与上述两类样本一一对应，每个成功或失败结束的任务
@@ -98,15 +107,24 @@ class Stats:
         self._window: "Deque[Tuple[float, float, float]]" = deque(
             maxlen=self._window_size if self._window_size > 0 else None
         )
-        # 区间边界：checkpoint_id -> 创建瞬间的（六项累计计数，三类样本长度）。
+        # 区间边界：checkpoint_id -> 创建瞬间的（六项累计计数，四类样本长度）。
         # 边界数据保存在 Stats 内而不是 checkpoint 对象上：checkpoint 只是
         # 不可变令牌，任何被篡改/伪造的令牌都无法通过 id 校验。
         self._checkpoints: Dict[int, tuple] = {}
         self._checkpoint_seq = 0
 
-    def record_accepted(self) -> None:
+    def record_accepted(self, admission_wait_ms: float = 0.0) -> None:
+        """记录一次接纳：accepted 加 1 并追加一个准入等待样本。
+
+        ``admission_wait_ms`` 为本次提交从进入容量准入判定到被原子接纳的
+        等待毫秒数：调用瞬间取得名额的提交为 0.0（缺省），进入过容量等待
+        队列的为入队到接纳的实测值（成组接纳时组内每个任务相同）。样本与
+        accepted 在同一原子顺序上按接纳时刻入账，此后无论任务成功、失败、
+        取消或排队到期都保留。
+        """
         with self._lock:
             self._accepted += 1
+            self._admission_wait.append(admission_wait_ms)
 
     def record_rejected(self) -> None:
         with self._lock:
@@ -154,6 +172,7 @@ class Stats:
                 cancelled=self._cancelled,
                 expired=self._expired,
                 rejected=self._rejected,
+                admission_wait_samples=list(self._admission_wait),
                 queue_wait_samples=list(self._queue_wait),
                 total_latency_samples=list(self._total_latency),
                 execution_samples=list(self._execution),
@@ -200,6 +219,7 @@ class Stats:
                 self._cancelled,
                 self._expired,
                 self._rejected,
+                len(self._admission_wait),
                 len(self._queue_wait),
                 len(self._total_latency),
                 len(self._execution),
@@ -209,10 +229,11 @@ class Stats:
     def snapshot_since(self, checkpoint: "StatsCheckpoint") -> "StatsSnapshot":
         """返回边界之后事件构成的差值快照（值拷贝，创建后不再变化）。
 
-        只统计边界后的事件：六项计数为当前累计值减去边界处累计值；三类
-        延迟样本只取边界后追加的部分（即边界后成功或失败结束的任务，
-        execution_ms 与 queue_wait_ms / total_latency_ms 一一对应）。
-        边界后无事件时计数全为 0，三个分布的 p50/p95/p99/max 均为 0.0。
+        只统计边界后的事件：六项计数为当前累计值减去边界处累计值；四类
+        延迟样本只取边界后追加的部分（准入等待样本对应边界后接纳的任务，
+        其余三类对应边界后成功或失败结束的任务，execution_ms 与
+        queue_wait_ms / total_latency_ms 一一对应）。
+        边界后无事件时计数全为 0，四个分布的 p50/p95/p99/max 均为 0.0。
         可反复查询，不改变累计统计，也不影响后续区间。
 
         入参不是本收集器创建的 :class:`StatsCheckpoint`（含其他收集器的
@@ -249,10 +270,14 @@ class Stats:
                     % (checkpoint_id,)
                 )
             (base_accepted, base_completed, base_failed, base_cancelled,
-             base_expired, base_rejected,
+             base_expired, base_rejected, base_admission_wait_len,
              base_queue_wait_len, base_total_latency_len,
              base_execution_len) = boundary
-            # 样本只追加、不移除：边界长度之后的切片恰为边界后结束的任务。
+            # 样本只追加、不移除：边界长度之后的切片恰为边界后的事件
+            # （准入等待样本按接纳时刻、其余三类按结束时刻入账）。
+            admission_wait_samples = self._admission_wait[
+                base_admission_wait_len:
+            ]
             queue_wait_samples = self._queue_wait[base_queue_wait_len:]
             total_latency_samples = self._total_latency[base_total_latency_len:]
             execution_samples = self._execution[base_execution_len:]
@@ -263,6 +288,7 @@ class Stats:
                 cancelled=self._cancelled - base_cancelled,
                 expired=self._expired - base_expired,
                 rejected=self._rejected - base_rejected,
+                admission_wait_samples=admission_wait_samples,
                 queue_wait_samples=queue_wait_samples,
                 total_latency_samples=total_latency_samples,
                 execution_samples=execution_samples,
@@ -279,6 +305,7 @@ class StatsSnapshot:
         "cancelled",
         "expired",
         "rejected",
+        "_admission_wait_samples",
         "_queue_wait_samples",
         "_total_latency_samples",
         "_execution_samples",
@@ -286,6 +313,7 @@ class StatsSnapshot:
 
     def __init__(self, *, accepted: int, completed: int, failed: int,
                  cancelled: int, expired: int, rejected: int,
+                 admission_wait_samples: List[float],
                  queue_wait_samples: List[float],
                  total_latency_samples: List[float],
                  execution_samples: List[float]) -> None:
@@ -295,9 +323,14 @@ class StatsSnapshot:
         self.cancelled = cancelled
         self.expired = expired
         self.rejected = rejected
+        self._admission_wait_samples = list(admission_wait_samples)
         self._queue_wait_samples = list(queue_wait_samples)
         self._total_latency_samples = list(total_latency_samples)
         self._execution_samples = list(execution_samples)
+
+    @property
+    def admission_wait_ms(self) -> Dict[str, float]:
+        return _distribution(self._admission_wait_samples)
 
     @property
     def queue_wait_ms(self) -> Dict[str, float]:
@@ -320,6 +353,7 @@ class StatsSnapshot:
             "cancelled": self.cancelled,
             "expired": self.expired,
             "rejected": self.rejected,
+            "admission_wait_ms": self.admission_wait_ms,
             "queue_wait_ms": self.queue_wait_ms,
             "total_latency_ms": self.total_latency_ms,
             "execution_ms": self.execution_ms,
@@ -328,12 +362,13 @@ class StatsSnapshot:
     def __repr__(self) -> str:  # pragma: no cover - 调试辅助
         return (
             "StatsSnapshot(accepted={a}, completed={c}, failed={f}, "
-            "cancelled={cn}, expired={ex}, rejected={r}, queue_wait_ms={qw}, "
+            "cancelled={cn}, expired={ex}, rejected={r}, "
+            "admission_wait_ms={aw}, queue_wait_ms={qw}, "
             "total_latency_ms={tl}, execution_ms={exd})".format(
                 a=self.accepted, c=self.completed, f=self.failed,
                 cn=self.cancelled, ex=self.expired, r=self.rejected,
-                qw=self.queue_wait_ms, tl=self.total_latency_ms,
-                exd=self.execution_ms,
+                aw=self.admission_wait_ms, qw=self.queue_wait_ms,
+                tl=self.total_latency_ms, exd=self.execution_ms,
             )
         )
 
