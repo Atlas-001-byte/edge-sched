@@ -178,6 +178,26 @@
   stats 始终包含 `admission_wait_ms`（CLI 提交均在调用瞬间获名额，样本
   为 `0.0`），结果数组仍按输入顺序，退出码与既有结果对象不变，不创建
   落盘文件。
+- 增量：批量取消。新增 `Scheduler.cancel_many(handles)`：`handles` 只能是
+  非空 list 或 tuple，每项都是本调度器创建的 `TaskHandle`（按对象身份
+  判重）；空集合、重复句柄、非 `TaskHandle`、其他调度器的句柄或错误容器
+  类型都抛 `InputValidationError`，且不改变任务、计数或延迟样本。通过
+  校验后整批在同一原子状态边界（一次 `_cond` 持锁）内按输入顺序逐个
+  裁决，返回与 `handles` 等长同序的布尔元组：仍处于已接纳、未认领、
+  未取消、未到期状态的句柄置为取消终态并返回 `True`（语义与
+  `TaskHandle.cancel` 完全一致——callable 绝不执行，`result` 抛
+  `TaskCancelledError`，accepted 与 cancelled 各计一次，不计
+  completed/failed/expired 或任何延迟样本，`max_pending` 名额立即释放
+  并按既有 FIFO 准入规则逐个提升等待者）；已开始、已成功、已失败、
+  已取消、已到期或已被并发调用抢先改变的句柄返回 `False`。工作线程
+  认领、排队到期、单项取消与批量取消交错时在同一把锁上只决出一种结果，
+  裁决按输入顺序进行、不因线程唤醒顺序而变化；一次调用可混合成功与跳过，
+  不影响 `handles` 之外的任务，批量调用本身不计入 accepted、rejected
+  或任何延迟分布。`close` 可与之并发：关闭开始后已排队句柄仍可被抢先
+  取消，close 等待执行中任务结束后退出；close 之后调用对已完成句柄返回
+  `False`，不抛 `SchedulerClosedError`。四个提交入口、单句柄取消、
+  优先级、老化、排队到期、背压、统计快照、滚动窗口、resize_workers、
+  结果读取、CLI 输出与退出码均不变，本功能不产生落盘文件。
 
 ## 约定
 

@@ -12,6 +12,9 @@
   成组原子准入：整组任务要么一次全部获得 max_pending 名额，要么继续在同一条
   FIFO 准入队列中等待（后续单任务/小组不得绕过），按输入顺序返回
   :class:`~edge_sched.scheduler.TaskHandle` 元组。
+- :func:`~edge_sched.scheduler.Scheduler.cancel_many` -- 批量取消已接纳
+  但尚未开始执行的任务：整批在同一原子状态边界按输入顺序裁决，返回与输入
+  等长同序的布尔元组。
 - :func:`~edge_sched.scheduler.Scheduler.snapshot` -- 累计统计快照。
 - :func:`~edge_sched.scheduler.Scheduler.runtime_snapshot` -- 同一逻辑时刻的
   不可变即时运行观测 :class:`~edge_sched.scheduler.RuntimeSnapshot`

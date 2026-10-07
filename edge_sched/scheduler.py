@@ -43,6 +43,18 @@
   期间组内全部 task_id 即被占用；超时整组被拒（rejected 加 1），close 时
   未被整组接纳则整组得到 SchedulerClosedError（rejected 不变）——任何
   失败路径都不创建任务、不执行 callable、不改变延迟样本。
+- cancel_many 把一次调用中的多个 TaskHandle 作为整批在同一原子状态边界
+  内裁决：handles 只能是非空 list 或 tuple，每项都是本调度器创建的
+  TaskHandle（按对象身份判重）；空集合、重复句柄、非 TaskHandle、其他
+  调度器的句柄或错误容器类型都抛 InputValidationError，且不改变任务、
+  计数或延迟样本。通过校验后整批在一次持锁内按输入顺序逐个裁决，返回
+  与 handles 等长同序的布尔元组：仍处于已接纳、未认领、未取消、未到期
+  状态的句柄置为取消终态并返回 True（语义与 TaskHandle.cancel 完全
+  一致），已开始、已结束或已被并发调用抢先改变的句柄返回 False。批量
+  取消不计入 accepted/rejected，也不贡献延迟样本；每个成功取消释放的
+  名额按既有 FIFO 准入规则逐个提升等待者。close 可与之并发：关闭开始
+  后已排队句柄仍可被抢先取消，close 之后调用对已完成句柄返回 False，
+  不抛 SchedulerClosedError。
 - close 先令新 submit 失败，再等待全部已接受任务结束，最后停止线程；
   已取消/已到期任务不阻塞关闭，已完成/已取消/已到期任务的结果在关闭后
   仍可读取。close 开始时尚在准入队列中等待的调用立即得到
@@ -809,6 +821,76 @@ class Scheduler:
             )
         return tuple(TaskHandle(self, entry) for entry in entries)
 
+    def cancel_many(
+        self, handles: "list[TaskHandle] | tuple[TaskHandle, ...]"
+    ) -> "tuple[bool, ...]":
+        """批量取消已接纳但尚未开始执行的任务，整批在同一原子状态边界裁决。
+
+        ``handles`` 只能是非空 list 或 tuple，每项都是本调度器创建的
+        :class:`TaskHandle`；空集合、重复句柄（按对象身份判重）、非
+        TaskHandle、其他调度器的句柄或错误容器类型都抛
+        :class:`InputValidationError`，且不改变任何任务、计数或延迟样本。
+
+        通过校验后，整批在一次 ``_cond`` 持锁内按输入顺序逐个裁决，返回
+        与 ``handles`` 等长、同序的布尔元组：
+
+        - 仍处于已接纳、未认领、未取消、未到期状态的句柄：置为取消终态
+          并返回 True，语义与 :meth:`TaskHandle.cancel` 完全一致——
+          callable 绝不执行，``done`` 为 True，``result`` 抛
+          :class:`TaskCancelledError`，accepted 与 cancelled 各计一次，
+          不计 completed/failed/expired 或任何延迟样本，``max_pending``
+          名额立即释放并按既有 FIFO 准入规则逐个提升等待者。
+        - 已开始、已成功、已失败、已取消、已到期，或已被并发调用抢先
+          改变的句柄：返回 False，原终态与结果不受影响。
+
+        工作线程认领、排队到期、单项取消与批量取消交错时在同一把锁上
+        只决出一种结果；裁决按输入顺序进行，不因线程唤醒顺序而变化。
+        一次调用可混合成功与跳过，不影响 ``handles`` 之外的任务；批量
+        调用本身不计入 accepted、rejected 或任何延迟分布。
+
+        :meth:`close` 可与本方法并发：关闭开始后已排队句柄仍可被抢先
+        取消；close 完成之后调用对已完成句柄返回 False，不抛
+        :class:`SchedulerClosedError`。
+        """
+        if not isinstance(handles, (list, tuple)) or len(handles) == 0:
+            raise InputValidationError(
+                "handles must be a non-empty list or tuple, got %r"
+                % (handles,)
+            )
+        seen: set[int] = set()
+        for index, handle in enumerate(handles):
+            if not isinstance(handle, TaskHandle):
+                raise InputValidationError(
+                    "handle at index %d must be a TaskHandle, got %s"
+                    % (index, type(handle).__name__)
+                )
+            if handle._scheduler is not self:
+                raise InputValidationError(
+                    "handle at index %d belongs to a different scheduler"
+                    % index
+                )
+            if id(handle) in seen:
+                raise InputValidationError(
+                    "duplicate handle at index %d" % index
+                )
+            seen.add(id(handle))
+
+        cancelled: "list[_TaskEntry]" = []
+        with self._cond:
+            results = tuple(
+                self._cancel_locked(handle._entry) for handle in handles
+            )
+            cancelled = [
+                handle._entry
+                for handle, ok in zip(handles, results)
+                if ok
+            ]
+        # done 在锁外置位：终态与计数已在锁内落定，被唤醒的等待方只会
+        # 读到一致的取消终态（与单项取消同一模式）。
+        for entry in cancelled:
+            entry.done.set()
+        return results
+
     def result(self, task_id: str) -> Any:
         """读取一个已结束任务的结果（非阻塞）。
 
@@ -1389,24 +1471,35 @@ class Scheduler:
         释放 pending 额度与 task_id 占用、计入 cancelled 并唤醒等待方。
         """
         with self._cond:
-            if (entry.started or entry.cancelled or entry.expired
-                    or entry.done.is_set()):
+            if not self._cancel_locked(entry):
                 return False
-            entry.cancelled = True
-            entry.exception = TaskCancelledError(
-                "task %r was cancelled before it started" % (entry.task_id,)
-            )
-            self._pending -= 1
-            self._unfinished.discard(entry.task_id)
-            self._queued.discard(entry.task_id)
-            self._stats.record_cancelled()
-            # 名额释放：若有准入等待者，在锁内考察队首——余量足以容纳其
-            # 整组时一次性接纳，否则本次释放不接纳任何人。
-            self._promote_waiter_locked()
-            self._cond.notify_all()
         # done 在锁外置位：结果字段与计数在锁内已全部落定，
         # 被唤醒的等待方只会读到一致的取消终态。
         entry.done.set()
+        return True
+
+    def _cancel_locked(self, entry: "_TaskEntry") -> bool:
+        """把任务置入取消终态；调用时须持有 ``_cond``，返回是否成功。
+
+        与认领、到期在同一把锁上以先到者为准。取消成功即释放 pending
+        额度与 task_id 占用、计入 cancelled 并唤醒等待方；``done`` 由
+        调用方在锁外置位。单项取消与批量取消共用本方法。
+        """
+        if (entry.started or entry.cancelled or entry.expired
+                or entry.done.is_set()):
+            return False
+        entry.cancelled = True
+        entry.exception = TaskCancelledError(
+            "task %r was cancelled before it started" % (entry.task_id,)
+        )
+        self._pending -= 1
+        self._unfinished.discard(entry.task_id)
+        self._queued.discard(entry.task_id)
+        self._stats.record_cancelled()
+        # 名额释放：若有准入等待者，在锁内考察队首——余量足以容纳其
+        # 整组时一次性接纳，否则本次释放不接纳任何人。
+        self._promote_waiter_locked()
+        self._cond.notify_all()
         return True
 
     def _expire_locked(self, entry: "_TaskEntry") -> bool:
